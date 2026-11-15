@@ -1,0 +1,8 @@
+# the compiled program, built by scripts/checknumber-autostart.sh install
+/bin/
+
+# Telnyx keys file and any other local env file: never commit
+/env.apikeys
+*.apikeys
+.env
+.env.*

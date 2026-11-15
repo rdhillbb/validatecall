@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>checknumber Test Page</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* Layout and colours copied from the approved mockup (UX-1), without its review bar */
+:root {
+  --bg: #f6f7f9; --panel: #ffffff; --fg: #1b2330; --muted: #5b6676; --line: #d5dae2;
+  --accent: #1f5f8b; --accent-soft: #e3eef6; --on-accent: #ffffff;
+  --ok: #2e7d4f; --ok-soft: #e4f3ea; --warn: #9a6512; --warn-soft: #fbf0dc; --bad: #b83a3a; --bad-soft: #f8e4e4;
+  --sans: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #12161c; --panel: #1a2029; --fg: #e4e8ee; --muted: #9aa5b4; --line: #2e3744;
+  --accent: #6fb0dd; --accent-soft: #1d3142; --on-accent: #0d1620;
+  --ok: #5cc48a; --ok-soft: #173326; --warn: #e0a845; --warn-soft: #3a2c12; --bad: #ec7a7a; --bad-soft: #3a1c1c;
+  color-scheme: dark; } }
+:root[data-theme="dark"] {
+  --bg: #12161c; --panel: #1a2029; --fg: #e4e8ee; --muted: #9aa5b4; --line: #2e3744;
+  --accent: #6fb0dd; --accent-soft: #1d3142; --on-accent: #0d1620;
+  --ok: #5cc48a; --ok-soft: #173326; --warn: #e0a845; --warn-soft: #3a2c12; --bad: #ec7a7a; --bad-soft: #3a1c1c;
+  color-scheme: dark; }
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.55 var(--sans); }
+.wrap { max-width: 720px; margin: 0 auto; padding-block: 24px 64px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px));
+  display: grid; gap: 20px; }
+h1 { margin: 0; font-size: 1.5rem; font-weight: 600; }
+.sub { color: var(--muted); margin: 0; }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 18px; display: grid; gap: 14px; min-width: 0; }
+.panel[hidden] { display: none; }
+label { font-weight: 500; }
+.form { display: flex; flex-wrap: wrap; gap: 10px; align-items: end; }
+.form .field { display: grid; gap: 6px; flex: 1 1 240px; }
+input[type=tel] { font: 500 1.1rem var(--mono); padding: 10px 12px; border-radius: 8px; border: 1px solid var(--line); background: var(--bg); color: var(--fg); width: 100%; }
+input[type=tel]:focus-visible, button:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+.primary { font: 600 1rem var(--sans); padding: 11px 22px; border-radius: 8px; border: 0; background: var(--accent); color: var(--on-accent); cursor: pointer; }
+.hint { font-size: 0.85rem; color: var(--muted); margin: 0; }
+.error { color: var(--bad); font-weight: 500; margin: 0; }
+.result-head { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px; }
+.chip { font: 600 1.05rem var(--sans); padding: 4px 12px; border-radius: 999px; }
+.c-ok { background: var(--ok-soft); color: var(--ok); }
+.c-warn { background: var(--warn-soft); color: var(--warn); }
+.c-bad { background: var(--bad-soft); color: var(--bad); }
+.c-info { background: var(--accent-soft); color: var(--accent); }
+.meta { display: grid; grid-template-columns: max-content 1fr; gap: 4px 16px; font-size: 0.95rem; margin: 0; }
+.meta dt { color: var(--muted); }
+.meta dd { margin: 0; font-variant-numeric: tabular-nums; }
+.mono { font-family: var(--mono); }
+.saved { background: var(--accent-soft); color: var(--fg); border-radius: 8px; padding: 10px 12px; font-size: 0.95rem; }
+.player { display: flex; align-items: center; gap: 12px; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+.player audio { width: 100%; }
+.text-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
+.text-head strong { font-weight: 600; }
+.copy { font: 500 0.9rem var(--sans); padding: 6px 14px; border-radius: 6px; border: 1px solid var(--accent); background: transparent; color: var(--accent); cursor: pointer; }
+blockquote { margin: 0; padding: 12px 14px; border-radius: 8px; background: var(--bg); border: 1px solid var(--line); font-size: 1rem; }
+.calling { display: flex; align-items: center; gap: 14px; }
+.spin { width: 22px; height: 22px; border-radius: 50%; border: 3px solid var(--line); border-top-color: var(--accent); animation: spin 1s linear infinite; flex: none; }
+@keyframes spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .spin { animation: none; } }
+.history { width: 100%; border-collapse: collapse; font-size: 0.92rem; }
+.history th, .history td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); }
+.history th { font: 500 0.75rem var(--mono); text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+.history td { font-variant-numeric: tabular-nums; }
+.history tr:last-child td { border-bottom: 0; }
+.scroll { overflow-x: auto; }
+h2 { margin: 0; font-size: 1rem; font-weight: 600; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header style="display:grid;gap:4px">
+    <h1>Check a number</h1>
+    <p class="sub">Test page. Enter one fax number and press Check.</p>
+  </header>
+
+  <form class="panel" id="f" method="post" action="/check" autocomplete="off">
+    <div class="form">
+      <div class="field">
+        <label for="num">Phone number</label>
+        <input id="num" name="number" type="tel" value="{{.Input}}">
+      </div>
+      <button class="primary" type="submit">Check</button>
+    </div>
+    {{- if .Error}}
+    <p class="error" role="alert" id="error">{{.Error}}</p>
+    {{- end}}
+    <p class="hint">A number checked in the last 60 days is not dialled again; you get the last result. A new call takes up to about 90 seconds.</p>
+  </form>
+
+  <section class="panel" id="result" aria-live="polite"{{if not .Result}} hidden{{end}}>
+  {{- with .Result}}
+    <div class="result-head"><span class="chip {{.Chip}}">{{.Label}}</span>{{if .Hint}}<span class="hint">{{.Hint}}</span>{{end}}</div>
+    {{- if .Saved}}
+    <div class="saved" id="saved">Saved result from a call {{.SavedDays}} days ago. Not dialled again. A new call happens after 60 days.</div>
+    {{- end}}
+    <dl class="meta"><dt>Number</dt><dd class="mono">{{.Number}}</dd><dt>Called</dt><dd>{{.CalledAt}}</dd>{{if .Reason}}<dt>Reason</dt><dd>{{.Reason}}</dd>{{end}}</dl>
+    {{- if .Audio}}
+    <div class="player"><audio controls preload="metadata" src="{{.Audio}}"></audio></div>
+    {{- end}}
+    {{- if .Text}}
+    <div class="text-head"><strong>What the message said</strong><button class="copy" type="button" id="copy">Copy text</button></div>
+    <blockquote id="txt">{{.Text}}</blockquote>
+    {{- end}}
+    {{- if .Redial}}
+    <p class="hint">The next check of this number will dial again.</p>
+    {{- end}}
+  {{- end}}
+  </section>
+
+  <template id="calling">
+    <div class="calling"><div class="spin" aria-hidden="true"></div><div><strong>Calling <span data-number></span></strong><p class="hint">Ringing. This can take up to about 90 seconds.</p></div></div>
+  </template>
+
+  {{- if .History}}
+  <section class="panel" id="hist">
+    <h2>Earlier checks of this number</h2>
+    <div class="scroll">
+    <table class="history">
+      <thead><tr><th>Date and time of call (Eastern)</th><th>Result</th></tr></thead>
+      <tbody>
+        {{- range .History}}
+        <tr><td>{{.CalledAt}}</td><td>{{.Label}}</td></tr>
+        {{- end}}
+      </tbody>
+    </table>
+    </div>
+  </section>
+  {{- end}}
+
+</div>
+
+<script>
+const copyFeedbackMilliseconds = 1500;
+// The page is server-rendered (TC-25); the script only shows "Calling" while
+// the form waits and copies the message text.
+document.getElementById('f').addEventListener('submit', () => {
+  const box = document.getElementById('result');
+  box.replaceChildren(document.getElementById('calling').content.cloneNode(true));
+  box.querySelector('[data-number]').textContent = document.getElementById('num').value;
+  box.hidden = false;
+});
+const copy = document.getElementById('copy');
+if (copy) copy.addEventListener('click', () => {
+  const txt = document.getElementById('txt');
+  const done = () => { copy.textContent = 'Copied'; setTimeout(() => copy.textContent = 'Copy text', copyFeedbackMilliseconds); };
+  // Without clipboard access the text is selected so it can be copied by hand.
+  const select = () => { const r = document.createRange(); r.selectNodeContents(txt); const s = getSelection(); s.removeAllRanges(); s.addRange(r); };
+  if (navigator.clipboard) navigator.clipboard.writeText(txt.textContent).then(done, select);
+  else select();
+});
+</script>
+</body>
+</html>
