@@ -40,6 +40,7 @@ var (
 		"CHECKNUMBER_API_KEY",
 		"CHECKNUMBER_ENV_FILE",
 		"CHECKNUMBER_TUNNEL",
+		"CHECKNUMBER_LOG_FILE",
 	}
 	// telnyxSettings are the four the settings file may hold (R-25).
 	telnyxSettings = []string{"TELNYX_API_KEY", "TELNYX_PUBLIC_KEY", "TELNYX_CONNECTION_ID", "TELNYX_FROM_NUMBER"}
@@ -99,8 +100,8 @@ func newTestKey(t *testing.T) string {
 }
 
 // setAll sets every setting to a valid test value and returns them by name.
-// The settings file and the tunnel mode are set empty, so a file or a mode in
-// the environment the tests run in never reaches Load.
+// The settings file, the tunnel mode and the log file are set empty, so a
+// file or a mode in the environment the tests run in never reaches Load.
 func setAll(t *testing.T) map[string]string {
 	t.Helper()
 	values := map[string]string{
@@ -118,6 +119,7 @@ func setAll(t *testing.T) map[string]string {
 		"PGDATABASE":                       testDatabase,
 		"CHECKNUMBER_ENV_FILE":             "",
 		"CHECKNUMBER_TUNNEL":               "",
+		"CHECKNUMBER_LOG_FILE":             "",
 	}
 	for name, v := range values {
 		t.Setenv(name, v)
@@ -593,6 +595,50 @@ func assertNoValue(t *testing.T, msg string, values map[string]string) {
 		if v != "" && strings.Contains(msg, v) {
 			t.Errorf("error %q contains the value of %s", msg, name)
 		}
+	}
+}
+
+// TestLogFileSetting: CHECKNUMBER_LOG_FILE is optional, its value is taken
+// as it is, and no value of it stops Load, not even a path that cannot be a
+// file: the app must still start (R-29, TC-44, AD-7).
+func TestLogFileSetting(t *testing.T) {
+	underFile := filepath.Join(t.TempDir(), "plain-file-test")
+	if err := os.WriteFile(underFile, nil, 0o600); err != nil {
+		t.Fatalf("write %s: %v", underFile, err)
+	}
+	// The folder does not exist: Load does not create or check it.
+	logPath := filepath.Join(t.TempDir(), "logs-test", "checknumber.log")
+	pathUnderFile := filepath.Join(underFile, "checknumber.log")
+	cases := []struct {
+		name, value, want string
+		// notSet removes the variable instead of setting it to value.
+		notSet bool
+	}{
+		{"not set", "", "", true},
+		{"empty", "", "", false},
+		{"only spaces", "   ", "", false},
+		{"a path", logPath, logPath, false},
+		{"a path under a file", pathUnderFile, pathUnderFile, false},
+		{"a relative path", "relative-test.log", "relative-test.log", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			setAll(t)
+			// Setenv first, so the variable is restored after the test.
+			t.Setenv("CHECKNUMBER_LOG_FILE", c.value)
+			if c.notSet {
+				if err := os.Unsetenv("CHECKNUMBER_LOG_FILE"); err != nil {
+					t.Fatalf("unset CHECKNUMBER_LOG_FILE: %v", err)
+				}
+			}
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load with CHECKNUMBER_LOG_FILE=%q: %v", c.value, err)
+			}
+			if cfg.LogFile != c.want {
+				t.Errorf("LogFile = %q, want %q", cfg.LogFile, c.want)
+			}
+		})
 	}
 }
 

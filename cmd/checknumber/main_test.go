@@ -22,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -29,6 +30,7 @@ import (
 
 	"checknumber/internal/check"
 	"checknumber/internal/config"
+	"checknumber/internal/logfile"
 	"checknumber/internal/result"
 	"checknumber/internal/store"
 	"checknumber/internal/telnyx"
@@ -825,4 +827,236 @@ func TestStartupLine(t *testing.T) {
 			}
 		})
 	}
+}
+
+// The log file tests (TC-44). Every log file is in t.TempDir().
+const (
+	logFileName   = "checknumber-test.log"
+	setAsideName  = logFileName + ".1"
+	plainFileName = "plain-file-test"
+	laterLine     = "checknumber: a later test line"
+	// The start of the line that names a log file that cannot be opened.
+	cannotOpenPrefix = "checknumber: cannot open log file "
+)
+
+// keepLogOutput restores the global logger's output when the test ends.
+func keepLogOutput(t *testing.T) {
+	t.Helper()
+	previous := log.Writer()
+	t.Cleanup(func() { log.SetOutput(previous) })
+}
+
+// readFile returns the content of path, failing the test when it cannot.
+func readFile(t *testing.T, path string) string {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return string(raw)
+}
+
+// pathUnderFile returns a log path whose folder is a regular file, so the log
+// cannot be opened.
+func pathUnderFile(t *testing.T) string {
+	t.Helper()
+	file := filepath.Join(t.TempDir(), plainFileName)
+	if err := os.WriteFile(file, nil, 0o600); err != nil {
+		t.Fatalf("write %s: %v", file, err)
+	}
+	return filepath.Join(file, logFileName)
+}
+
+// TestOpenLogFile: with a path, the start-up line and later lines go into the
+// file, nothing goes to standard error, and the writer is the log file that
+// sets itself aside (DD-2: R-29, R-30, AD-7).
+func TestOpenLogFile(t *testing.T) {
+	keepLogOutput(t)
+	// The folder is missing: the log file creates it.
+	path := filepath.Join(t.TempDir(), "logs-test", logFileName)
+	var stderr bytes.Buffer
+
+	out, closeLog := openLog(path, &stderr)
+	if _, ok := out.(*logfile.File); !ok {
+		t.Fatalf("openLog returned a %T, want the log file *logfile.File", out)
+	}
+	log.SetOutput(out)
+	logStartup(config.Config{Port: testLocalPort, EventsPort: testEventsPort, Database: startupDatabase})
+	log.Print(laterLine)
+	// Two lines that together pass the limit: the second sets the file aside.
+	half := strings.Repeat("x", logfile.MaxBytes/2)
+	log.Print(half)
+	log.Print(half)
+	if err := closeLog(); err != nil {
+		t.Fatalf("close the log file: %v", err)
+	}
+
+	if stderr.Len() != 0 {
+		t.Errorf("standard error got %q, want nothing", stderr.String())
+	}
+	setAside := readFile(t, filepath.Join(filepath.Dir(path), setAsideName))
+	for _, want := range []string{startupPrefixFor(startupDatabase), laterLine} {
+		if !strings.Contains(setAside, want) {
+			t.Errorf("set-aside log file does not contain %q", want)
+		}
+	}
+	current := readFile(t, path)
+	if strings.Count(current, "\n") != 1 || !strings.HasSuffix(current, half+"\n") {
+		t.Errorf("log file after the set-aside holds %d line(s), want only the last one", strings.Count(current, "\n"))
+	}
+	if len(current) > logfile.MaxBytes {
+		t.Errorf("log file is %d bytes, more than %d", len(current), logfile.MaxBytes)
+	}
+}
+
+// TestOpenLogEmpty: with no path, log lines go to standard error as before
+// (DD-3: R-32).
+func TestOpenLogEmpty(t *testing.T) {
+	keepLogOutput(t)
+	var stderr bytes.Buffer
+
+	out, closeLog := openLog("", &stderr)
+	if out != io.Writer(&stderr) {
+		t.Fatalf("openLog returned a %T, want standard error", out)
+	}
+	log.SetOutput(out)
+	log.Print(laterLine)
+	if err := closeLog(); err != nil {
+		t.Errorf("close with no log file: %v", err)
+	}
+	if got := stderr.String(); strings.Count(got, "\n") != 1 || !strings.HasSuffix(got, laterLine+"\n") {
+		t.Errorf("standard error got %q, want the one line %q", got, laterLine)
+	}
+}
+
+// TestOpenLogFails: a log file that cannot be opened gives one line on
+// standard error naming the path and the cause, and logging continues there
+// (DD-4: AD-7).
+func TestOpenLogFails(t *testing.T) {
+	keepLogOutput(t)
+	path := pathUnderFile(t)
+	var stderr bytes.Buffer
+
+	out, closeLog := openLog(path, &stderr)
+	if out != io.Writer(&stderr) {
+		t.Fatalf("openLog returned a %T, want standard error", out)
+	}
+	notice := stderr.String()
+	if strings.Count(notice, "\n") != 1 || !strings.Contains(notice, cannotOpenPrefix+path) {
+		t.Errorf("standard error got %q, want one line with %q", notice, cannotOpenPrefix+path)
+	}
+	if !strings.Contains(notice, syscall.ENOTDIR.Error()) {
+		t.Errorf("line %q does not name the cause %q", notice, syscall.ENOTDIR.Error())
+	}
+
+	log.SetOutput(out)
+	log.Print(laterLine)
+	if err := closeLog(); err != nil {
+		t.Errorf("close with no log file: %v", err)
+	}
+	if got := strings.TrimPrefix(stderr.String(), notice); strings.Count(got, "\n") != 1 || !strings.HasSuffix(got, laterLine+"\n") {
+		t.Errorf("standard error after the notice got %q, want the one line %q", got, laterLine)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, syscall.ENOTDIR) {
+		t.Errorf("stat %s: %v, want %v", path, err, syscall.ENOTDIR)
+	}
+}
+
+// TestRunLogFile: run opens the log right after the settings, before the
+// start-up line, still starts when the file cannot be opened, and the error
+// that ends it goes into the log too (TC-44, AD-7). The start ends at the
+// database step: the search path names a schema that does not exist, so
+// nothing is created in checknumber_test and no listener is opened.
+func TestRunLogFile(t *testing.T) {
+	// The error of the database step, as run returns it and as it logs it.
+	const (
+		wantErr = "prepare database: "
+		wantEnd = "checknumber: " + wantErr
+	)
+	pub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate test key: %v", err)
+	}
+	for _, tc := range []struct {
+		name string
+		// toFile: the log file opens, so the lines go there.
+		toFile bool
+	}{
+		{"log file", true},
+		{"log file cannot be opened", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			keepLogOutput(t)
+			path := filepath.Join(t.TempDir(), logFileName)
+			if !tc.toFile {
+				path = pathUnderFile(t)
+			}
+			settings := map[string]string{
+				"CHECKNUMBER_PORT":                 strconv.Itoa(testLocalPort),
+				"CHECKNUMBER_EVENTS_PORT":          strconv.Itoa(testEventsPort),
+				"CHECKNUMBER_PUBLIC_URL":           testPublicURL,
+				"CHECKNUMBER_RECORDINGS_DIR":       t.TempDir(),
+				"TELNYX_API_KEY":                   testTelnyxKey,
+				"TELNYX_PUBLIC_KEY":                base64.StdEncoding.EncodeToString(pub),
+				"TELNYX_FROM_NUMBER":               otherNumber,
+				"TELNYX_CONNECTION_ID":             testConnectionID,
+				"CHECKNUMBER_CHECK_LIMIT":          "",
+				"CHECKNUMBER_COMBINE_DISCONNECTED": "",
+				"CHECKNUMBER_API_KEY":              "",
+				"CHECKNUMBER_ENV_FILE":             "",
+				"CHECKNUMBER_TUNNEL":               "",
+				"CHECKNUMBER_LOG_FILE":             path,
+				"PGDATABASE":                       testDatabase,
+				"PGOPTIONS":                        fmt.Sprintf("-c search_path=main_test_missing_%d", time.Now().UnixNano()),
+			}
+			for name, v := range settings {
+				t.Setenv(name, v)
+			}
+			stderr, err := os.CreateTemp(t.TempDir(), "stderr-test")
+			if err != nil {
+				t.Fatalf("create standard error file: %v", err)
+			}
+			realStderr := os.Stderr
+			os.Stderr = stderr
+			t.Cleanup(func() {
+				os.Stderr = realStderr
+				if err := stderr.Close(); err != nil {
+					t.Errorf("close standard error file: %v", err)
+				}
+			})
+
+			err = run(context.Background())
+			if err == nil || !strings.HasPrefix(err.Error(), wantErr) {
+				t.Fatalf("run = %v, want the error of the database step", err)
+			}
+			if log.Writer() != io.Writer(stderr) {
+				t.Errorf("after run the log goes to a %T, want standard error again", log.Writer())
+			}
+			gotStderr := readFile(t, stderr.Name())
+			wantLines := []string{startupPrefixFor(testDatabase), wantEnd}
+			logged := gotStderr
+			if tc.toFile {
+				logged = readFile(t, path)
+				if gotStderr != "" {
+					t.Errorf("standard error got %q, want nothing", gotStderr)
+				}
+			} else {
+				wantLines = append([]string{cannotOpenPrefix + path}, wantLines...)
+			}
+			lines := strings.Split(strings.TrimSuffix(logged, "\n"), "\n")
+			if len(lines) != len(wantLines) {
+				t.Fatalf("log holds %d line(s) %q, want %d", len(lines), logged, len(wantLines))
+			}
+			for i, want := range wantLines {
+				if !strings.Contains(lines[i], want) {
+					t.Errorf("log line %d = %q, want it to contain %q", i+1, lines[i], want)
+				}
+			}
+		})
+	}
+}
+
+// startupPrefixFor is the start of the start-up line for database (D-8).
+func startupPrefixFor(database string) string {
+	return fmt.Sprintf("checknumber: starting with database %q", database)
 }

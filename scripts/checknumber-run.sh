@@ -16,6 +16,10 @@ EVENTS_PORT_NAME="checknumber-events"
 DATABASE_NAME="checknumber"
 ENV_FILE_NAME="env.apikeys"
 RECORDINGS_FOLDER="checknumber-recordings"
+# The app's own log (TC-44); the app creates the folder and sets the file
+# aside itself (R-30).
+LOG_DIR="$HOME/Library/Logs/checknumber"
+LOG_FILE="$LOG_DIR/checknumber.log"
 # TC-32: with this value the app starts the tunnel itself, so no public
 # address has to be known before the start.
 TUNNEL_MODE="cloudflared"
@@ -35,15 +39,23 @@ CHECKNUMBER_EVENTS_PORT="$("$REGISTRY" get "$EVENTS_PORT_NAME")" || fail "the po
 export CHECKNUMBER_PORT CHECKNUMBER_EVENTS_PORT
 
 # A value that is already set is kept, so ~/.zshrc can override any of the
-# four, including an empty value (an empty tunnel mode disables the tunnel).
+# five, including an empty value (an empty tunnel mode disables the tunnel,
+# an empty log file sends the app's lines to the start log).
 export PGDATABASE="${PGDATABASE-$DATABASE_NAME}"
 export CHECKNUMBER_ENV_FILE="${CHECKNUMBER_ENV_FILE-$REPO/$ENV_FILE_NAME}"
 export CHECKNUMBER_TUNNEL="${CHECKNUMBER_TUNNEL-$TUNNEL_MODE}"
+export CHECKNUMBER_LOG_FILE="${CHECKNUMBER_LOG_FILE-$LOG_FILE}"
 # The app refuses a recordings folder that does not exist; only the default
 # one is created here.
 if [[ ! -v CHECKNUMBER_RECORDINGS_DIR ]]; then
   export CHECKNUMBER_RECORDINGS_DIR="$HOME/$RECORDINGS_FOLDER"
   mkdir -p "$CHECKNUMBER_RECORDINGS_DIR" || fail "cannot create the recordings folder $CHECKNUMBER_RECORDINGS_DIR"
 fi
+
+# The four Telnyx settings come from the settings file only (operator: "use
+# env.apikeys"). ~/.zshrc may export TELNYX_ variables of another project, and
+# a TELNYX_ variable wins over the file, so every one of them is removed here.
+# unset -m fails when no name matches, which set -e would make fatal.
+unset -m 'TELNYX_*' || true
 
 exec "$PROGRAM"

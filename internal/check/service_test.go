@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -999,5 +1000,253 @@ func TestCancelledInQueueNotLeftInProgress(t *testing.T) {
 	if row.State != store.StateDone || row.ResultCode != string(result.Unknown) ||
 		row.Reason != wantReasonCancelled || !row.StartedAt.IsZero() {
 		t.Errorf("cancelled check = %+v, want done, unknown, reason %q, never started", row, wantReasonCancelled)
+	}
+}
+
+// lineLog collects the check lines a Service writes through logf (R-29).
+type lineLog struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+func (l *lineLog) logf(format string, args ...any) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.lines = append(l.lines, fmt.Sprintf(format, args...))
+}
+
+func (l *lineLog) all() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]string(nil), l.lines...)
+}
+
+// captureLines makes the service write its check lines to the returned log.
+func (f *fixture) captureLines() *lineLog {
+	l := &lineLog{}
+	f.svc.logf = l.logf
+	return l
+}
+
+// slowDialer moves the test clock by took as each call begins, so the time a
+// check line reports is known.
+type slowDialer struct {
+	*fakeDialer
+	clock *testClock
+	took  time.Duration
+}
+
+func (d slowDialer) Call(ctx context.Context, number string) Outcome {
+	d.clock.set(d.clock.now().Add(d.took))
+	return d.fakeDialer.Call(ctx, number)
+}
+
+// wantLines fails the test unless got holds exactly want, in any order.
+func wantLines(t *testing.T, got []string, want ...string) {
+	t.Helper()
+	if !reflect.DeepEqual(slices.Sorted(slices.Values(got)), slices.Sorted(slices.Values(want))) {
+		t.Errorf("check lines = %q, want %q", got, want)
+	}
+}
+
+func TestCheckLineCall(t *testing.T) {
+	cases := []struct {
+		name    string
+		outcome Outcome
+		took    time.Duration
+		want    string
+	}{
+		{"answered call", voiceOutcome, 12300 * time.Millisecond,
+			"check number=+15552230001 result=voice_message source=call took=12.3s"},
+		// A dial Telnyx refused is still this request's own try (TC-48).
+		{"dial refused by Telnyx", Outcome{Code: result.Unknown, Reason: "Telnyx error: 10010"}, 400 * time.Millisecond,
+			`check number=+15552230001 result=unknown source=call took=0.4s reason="Telnyx error: 10010"`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t, newFakeDialer(tc.outcome, false))
+			f.svc.dialer = slowDialer{fakeDialer: f.dialer, clock: f.clock, took: tc.took}
+			lines := f.captureLines()
+
+			got, err := f.svc.Check(context.Background(), inputA)
+			if err != nil {
+				t.Fatalf("Check(%q): %v", inputA, err)
+			}
+			if got.Saved || got.Code != tc.outcome.Code || got.Reason != tc.outcome.Reason {
+				t.Errorf("Check(%q) = %+v, want the new call's outcome %+v", inputA, got, tc.outcome)
+			}
+			if calls := f.dialer.calls(); !reflect.DeepEqual(calls, []string{numberA}) {
+				t.Errorf("dialled %v, want one call to %s", calls, numberA)
+			}
+			wantLines(t, lines.all(), tc.want)
+		})
+	}
+}
+
+func TestCheckLineSaved(t *testing.T) {
+	f := newFixture(t, newFakeDialer(voiceOutcome, false))
+	f.seed(t, numberA, result.Fax, "", baseTime.Add(-day))
+	lines := f.captureLines()
+
+	got, err := f.svc.Check(context.Background(), inputA)
+	if err != nil {
+		t.Fatalf("Check(%q): %v", inputA, err)
+	}
+	if !got.Saved || got.Code != result.Fax {
+		t.Errorf("Check(%q) = %+v, want the saved fax", inputA, got)
+	}
+	if calls := f.dialer.calls(); len(calls) != 0 {
+		t.Errorf("dialled %v, want no call", calls)
+	}
+	wantLines(t, lines.all(), "check number=+15552230001 result=fax source=saved took=0.0s")
+}
+
+func TestCheckLineInternational(t *testing.T) {
+	f := newFixture(t, newFakeDialer(voiceOutcome, false))
+	lines := f.captureLines()
+	ctx := context.Background()
+
+	if _, err := f.svc.Check(ctx, inputAbroad); err != nil {
+		t.Fatalf("first Check(%q): %v", inputAbroad, err)
+	}
+	wantLines(t, lines.all(),
+		`check number=+442079460958 result=international source=none took=0.0s reason="not called: outside US and Canada"`)
+
+	if _, err := f.svc.Check(ctx, numberAbroad); err != nil {
+		t.Fatalf("second Check(%q): %v", numberAbroad, err)
+	}
+	wantLines(t, lines.all(),
+		`check number=+442079460958 result=international source=none took=0.0s reason="not called: outside US and Canada"`,
+		`check number=+442079460958 result=international source=saved took=0.0s reason="not called: outside US and Canada"`)
+	if calls := f.dialer.calls(); len(calls) != 0 {
+		t.Errorf("dialled %v, want no call", calls)
+	}
+}
+
+func TestCheckLineShared(t *testing.T) {
+	f := newFixture(t, newFakeDialer(voiceOutcome, true))
+	// The clock moves as the call begins and not again, so the waiter, which
+	// joins after that, reads no time passing.
+	f.svc.dialer = slowDialer{fakeDialer: f.dialer, clock: f.clock, took: 10 * time.Second}
+	lines := f.captureLines()
+
+	first := f.checkAsync(inputA)
+	receive(t, f.dialer.entered, "first dial")
+	second := f.checkAsync(numberA)
+	f.waitForWaiter(t, numberA)
+	close(f.dialer.release)
+	await(t, first, inputA)
+	await(t, second, numberA)
+
+	wantLines(t, lines.all(),
+		"check number=+15552230001 result=voice_message source=call took=10.0s",
+		"check number=+15552230001 result=voice_message source=shared took=0.0s")
+	if calls := f.dialer.calls(); !reflect.DeepEqual(calls, []string{numberA}) {
+		t.Errorf("dialled %v, want one call to %s", calls, numberA)
+	}
+}
+
+func TestCheckLineRefused(t *testing.T) {
+	// keyShaped stands for an API key pasted into the box by mistake (C-4); it
+	// is not a real key.
+	const keyShaped = "KEY0TESTONLY1NOTAREALKEY2"
+	cases := []struct {
+		input string
+		want  string
+	}{
+		{"", `check refused reason="Enter a phone number." took=0.0s`},
+		{"123", `check refused reason="This is not a valid US or Canada number." took=0.0s`},
+		{keyShaped, `check refused reason="This is not a valid US or Canada number." took=0.0s`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.input, func(t *testing.T) {
+			f := newFixture(t, newFakeDialer(voiceOutcome, false))
+			lines := f.captureLines()
+
+			var invalid *phone.InvalidError
+			if _, err := f.svc.Check(context.Background(), tc.input); !errors.As(err, &invalid) {
+				t.Fatalf("Check(%q) error = %v, want *phone.InvalidError", tc.input, err)
+			}
+			got := lines.all()
+			wantLines(t, got, tc.want)
+			for _, line := range got {
+				if tc.input != "" && strings.Contains(line, tc.input) {
+					t.Errorf("line %q contains the typed input %q", line, tc.input)
+				}
+			}
+			if rows, calls := f.rowCount(t), f.dialer.calls(); rows != 0 || len(calls) != 0 {
+				t.Errorf("rows %d, dialled %v; want nothing saved or dialled", rows, calls)
+			}
+		})
+	}
+}
+
+func TestCheckLineFailed(t *testing.T) {
+	t.Run("store error", func(t *testing.T) {
+		f := newFixture(t, newFakeDialer(voiceOutcome, false))
+		if _, err := f.admin.Exec(context.Background(), refuseUpdates); err != nil {
+			t.Fatalf("make the database refuse updates of checks: %v", err)
+		}
+		lines := f.captureLines()
+
+		_, err := f.svc.Check(context.Background(), inputA)
+		if err == nil || !strings.Contains(err.Error(), updateRefused) {
+			t.Fatalf("Check(%q) error = %v, want the refused update", inputA, err)
+		}
+		wantLines(t, lines.all(), fmt.Sprintf("check failed number=+15552230001 reason=%q took=0.0s", fmt.Sprintf("%T", err)))
+	})
+
+	t.Run("waiter that leaves", func(t *testing.T) {
+		f := newFixture(t, newFakeDialer(voiceOutcome, true))
+		lines := f.captureLines()
+
+		first := f.checkAsync(inputA)
+		receive(t, f.dialer.entered, "first dial")
+		ctx, leave := context.WithCancel(context.Background())
+		defer leave()
+		second := f.checkAsyncCtx(ctx, numberA)
+		f.waitForWaiter(t, numberA)
+		leave()
+		left := settle(t, second, numberA)
+		if !errors.Is(left.err, context.Canceled) {
+			t.Fatalf("waiting Check(%q) error = %v, want context.Canceled", numberA, left.err)
+		}
+		wantLines(t, lines.all(), fmt.Sprintf("check failed number=+15552230001 reason=%q took=0.0s", fmt.Sprintf("%T", left.err)))
+
+		close(f.dialer.release)
+		await(t, first, inputA)
+		wantLines(t, lines.all(),
+			fmt.Sprintf("check failed number=+15552230001 reason=%q took=0.0s", fmt.Sprintf("%T", left.err)),
+			"check number=+15552230001 result=voice_message source=call took=0.0s")
+	})
+
+	t.Run("dialer panic", func(t *testing.T) {
+		d := newFakeDialer(voiceOutcome, false)
+		d.panicCall = true
+		f := newFixture(t, d)
+		lines := f.captureLines()
+
+		_, err := f.svc.Check(context.Background(), inputA)
+		if err == nil || err.Error() != "check "+numberA+": call panicked" {
+			t.Fatalf("Check(%q) error = %v, want the call panic", inputA, err)
+		}
+		wantLines(t, lines.all(), fmt.Sprintf("check failed number=+15552230001 reason=%q took=0.0s", fmt.Sprintf("%T", err)))
+	})
+}
+
+func TestCheckLineQuoted(t *testing.T) {
+	quoted := Outcome{Code: result.Unknown, Reason: "said \"hello\"\nthen hung up"}
+	f := newFixture(t, newFakeDialer(quoted, false))
+	lines := f.captureLines()
+
+	if _, err := f.svc.Check(context.Background(), inputA); err != nil {
+		t.Fatalf("Check(%q): %v", inputA, err)
+	}
+	got := lines.all()
+	wantLines(t, got, `check number=+15552230001 result=unknown source=call took=0.0s reason="said \"hello\"\nthen hung up"`)
+	for _, line := range got {
+		if strings.ContainsAny(line, "\n\r") {
+			t.Errorf("line %q holds a line break", line)
+		}
 	}
 }

@@ -96,7 +96,9 @@ export CHECKNUMBER_ENV_FILE="$PWD/env.apikeys"
   when the file is missing, is not a regular file, or gives group or others
   any access; `chmod 600` above cures the last one. The message names the
   file's path and the cause, never a value from the file.
-- An environment variable of the `TELNYX_` name wins over the file.
+- An environment variable of the `TELNYX_` name wins over the file. The start
+  script of "Start at login" removes every `TELNYX_` variable first, so the
+  app started at login always reads the four from the file.
 
 ### The Telnyx settings, typed instead
 
@@ -128,6 +130,7 @@ read -r 'TELNYX_CONNECTION_ID?Telnyx Call Control application id: ' && export TE
 | `CHECKNUMBER_COMBINE_DISCONNECTED` | no | `true` reports "Disconnected / Unallocated" instead of the two separate results (R-23); default `false` |
 | `CHECKNUMBER_API_KEY` | no | shared key the fax system sends with each check API request in M-2 (AD-6, secret); when set, `/api/check` and `/api/history` answer 401 without `Authorization: Bearer <key>`; the test page never needs it |
 | `PGDATABASE` | yes | database name, `checknumber`; without it the database driver would use the database named after the user, so the app refuses to start (D-7) |
+| `CHECKNUMBER_LOG_FILE` | no | path of the app's log file. When set, every log line (start-up, Telnyx events, errors, one line per check) goes into that file instead of standard error; a missing folder is created. At 2 MB the file is set aside as `.1` (older ones move up to `.5`, the oldest is deleted) and a new one is started (R-30). If the file cannot be opened, the app says so on standard error, logs there and still starts. Not set or empty: log lines go to standard error, as in a start by hand (TC-44) |
 
 Only when the fax system calls the API (M-2), set the shared key the same
 way as the Telnyx keys: fetched live, typed at a hidden prompt, never saved.
@@ -196,7 +199,7 @@ command again: it builds the program again and restarts the app.
 
 macOS starts `scripts/checknumber-run.sh` through `zsh -ic`, so `~/.zshrc`
 supplies the database connection and the PATH. The start script takes both
-ports from the port registry and sets four settings. A value that `~/.zshrc`
+ports from the port registry and sets five settings. A value that `~/.zshrc`
 already exports is kept, including an empty value. An explicitly empty
 `CHECKNUMBER_TUNNEL` disables the automatic tunnel; supply
 `CHECKNUMBER_PUBLIC_URL` as in the manual steps in that case.
@@ -207,19 +210,34 @@ already exports is kept, including an empty value. An explicitly empty
 | `CHECKNUMBER_ENV_FILE` | `env.apikeys` in the repository folder |
 | `CHECKNUMBER_RECORDINGS_DIR` | `~/checknumber-recordings`, created when it is missing |
 | `CHECKNUMBER_TUNNEL` | `cloudflared`: the app starts the tunnel itself, so step 2 and `CHECKNUMBER_PUBLIC_URL` are not needed |
+| `CHECKNUMBER_LOG_FILE` | `~/Library/Logs/checknumber/checknumber.log`, the app's log |
+
+It also removes every `TELNYX_` variable, so the four Telnyx settings come
+from the settings file only (R-31).
 
 No port, key or password is written in the scripts or in the LaunchAgent
 (C-2, C-3, C-4).
 
-The log, output and errors together, is
-`~/Library/Logs/checknumber/checknumber.log`:
+There are two log files:
+
+- The app's log, `~/Library/Logs/checknumber/checknumber.log`: every line the
+  app writes (start-up, Telnyx events, errors, one line per check). When it
+  reaches 2 MB the app sets it aside as `checknumber.log.1` and starts a new
+  one; the 5 older files `.1` to `.5` are kept and the oldest is deleted
+  (R-30).
+- The start log, `checknumber-start.log` in `~/Library/Logs/checknumber/`:
+  what the app and the start script write to standard error. That is what comes
+  before the app opens its own log (a missing program, a refused setting), a
+  crash, a warning when setting the app's log aside fails, and, when the
+  app's log cannot be opened, every line of the app. It is not set aside.
 
 ```bash
 tail -f ~/Library/Logs/checknumber/checknumber.log
 ```
 
 When the app cannot start (a setting is missing, the program is not built),
-the log names the cause and macOS tries again, at most once every 10 seconds.
+the start log names the cause and macOS tries again, at most once every 10
+seconds.
 
 While it is installed, do not also start the app by hand (step 4): both would
 ask for the same two ports. Open the test page as in step 5, after step 1 in
@@ -232,7 +250,7 @@ scripts/checknumber-autostart.sh remove
 ```
 
 It unloads the LaunchAgent, which stops the app, and deletes
-`~/Library/LaunchAgents/com.checknumber.app.plist`. The program, the log and
+`~/Library/LaunchAgents/com.checknumber.app.plist`. The program, the logs and
 the recordings stay.
 
 `scripts/checknumber-autostart.sh print` shows the LaunchAgent without

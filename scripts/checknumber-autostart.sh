@@ -16,6 +16,10 @@ AGENTS_DIR="${LAUNCH_AGENTS_DIR:-$HOME/Library/LaunchAgents}"
 PLIST="$AGENTS_DIR/$LABEL.plist"
 LOG_DIR="$HOME/Library/Logs/checknumber"
 LOG_FILE="$LOG_DIR/checknumber.log"
+# The login service's own output goes to a file of its own, so the app's log
+# has one writer: setting it aside renames it, and launchd keeps its file
+# open (TC-45).
+START_LOG_FILE="$LOG_DIR/checknumber-start.log"
 # launchd's names for this user's login session and for the agent in it.
 DOMAIN="gui/$UID"
 SERVICE="$DOMAIN/$LABEL"
@@ -41,11 +45,11 @@ xml_text() {
 }
 
 print_plist() {
-  local start_command log_file
+  local start_command start_log
   # (q) quotes the path for the shell that reads the command, so a folder
   # name with a space still gives one word.
   start_command="$(xml_text "exec ${(q)RUN_SCRIPT}")"
-  log_file="$(xml_text "$LOG_FILE")"
+  start_log="$(xml_text "$START_LOG_FILE")"
   cat <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -64,9 +68,9 @@ print_plist() {
 	<key>KeepAlive</key>
 	<true/>
 	<key>StandardOutPath</key>
-	<string>$log_file</string>
+	<string>$start_log</string>
 	<key>StandardErrorPath</key>
-	<string>$log_file</string>
+	<string>$start_log</string>
 </dict>
 </plist>
 EOF

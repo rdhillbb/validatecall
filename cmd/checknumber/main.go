@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -20,6 +21,7 @@ import (
 	"checknumber/internal/check"
 	"checknumber/internal/config"
 	"checknumber/internal/httpapi"
+	"checknumber/internal/logfile"
 	"checknumber/internal/result"
 	"checknumber/internal/store"
 	"checknumber/internal/telnyx"
@@ -76,16 +78,32 @@ func main() {
 	err := run(ctx)
 	stop()
 	if err != nil {
-		log.Printf("checknumber: %v", err)
 		os.Exit(1)
 	}
 }
 
-func run(ctx context.Context) error {
+// run logs the error that ends it itself, so that line goes into the log file
+// while it is still open (TC-44). A refused setting comes before the log file
+// is opened and goes to standard error (TC-45).
+func run(ctx context.Context) (err error) {
 	cfg, err := config.Load()
 	if err != nil {
+		log.Printf("checknumber: %v", err)
 		return err
 	}
+	out, closeLog := openLog(cfg.LogFile, os.Stderr)
+	log.SetOutput(out)
+	defer func() {
+		if err != nil {
+			log.Printf("checknumber: %v", err)
+		}
+		// A line logged after the close, by a goroutine still ending, must not
+		// go to the closed file and be lost.
+		log.SetOutput(os.Stderr)
+		if closeErr := closeLog(); closeErr != nil {
+			log.Printf("checknumber: close log file %s: %v", cfg.LogFile, closeErr)
+		}
+	}()
 	logStartup(cfg)
 	st, err := store.Open(ctx)
 	if err != nil {
@@ -120,6 +138,28 @@ func run(ctx context.Context) error {
 		{Addr: cfg.EventsAddr(), Handler: events, ReadHeaderTimeout: readHeaderTimeout, ReadTimeout: eventsReadTimeout},
 	}, runner, tunnelExit)
 }
+
+// openLog returns the writer for log lines and the function that closes it.
+// With an empty path it is stderr, as before (R-32). Otherwise it is the log
+// file at path, which sets itself aside (R-30). A file that cannot be opened
+// is reported on stderr and logging stays there: a refusal to start would make
+// the login service restart the app every 10 seconds (AD-7, TC-44).
+func openLog(path string, stderr io.Writer) (io.Writer, func() error) {
+	if path == "" {
+		return stderr, closeNothing
+	}
+	file, err := logfile.Open(path)
+	if err != nil {
+		// The same time stamp form as every other log line (TC-49).
+		log.New(stderr, log.Prefix(), log.Flags()).Printf(
+			"checknumber: cannot open log file %s, logging to standard error: %v", path, err)
+		return stderr, closeNothing
+	}
+	return file, file.Close
+}
+
+// closeNothing is the close function of standard error, which stays open.
+func closeNothing() error { return nil }
 
 // logStartup writes the one line that says how this run is configured (D-8).
 // It names the database, the tunnel mode, whether the check API asks for its

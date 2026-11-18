@@ -194,8 +194,9 @@ One setting per line, `NAME:VALUE` or `NAME=VALUE`. Either name works:
 | `TELNYX_CONNECTION_ID` | `APPLICATIONID` | Call Control application id |
 | `TELNYX_FROM_NUMBER` | `FROMNUMBER` | number to call from, `+1...` |
 
-An environment variable of the `TELNYX_` name wins over the file. The other settings are
-environment variables:
+An environment variable of the `TELNYX_` name wins over the file, except under "Start at
+login": its start script removes every `TELNYX_` variable, so the app reads the four from the
+file. The other settings are environment variables:
 
 | Setting | Required | What it is |
 |---|---|---|

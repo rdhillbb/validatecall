@@ -44,6 +44,7 @@ const (
 	// The shell, its flags and the one command.
 	wantArguments     = 3
 	wantLogFile       = "Library/Logs/checknumber/checknumber.log"
+	wantStartLogFile  = "Library/Logs/checknumber/checknumber-start.log"
 	wantLogFolder     = "Library/Logs/checknumber"
 	wantDatabase      = "checknumber"
 	wantEnvFile       = "env.apikeys"
@@ -57,6 +58,7 @@ const (
 	envFile          = "CHECKNUMBER_ENV_FILE"
 	envRecordingsDir = "CHECKNUMBER_RECORDINGS_DIR"
 	envTunnel        = "CHECKNUMBER_TUNNEL"
+	envLogFile       = "CHECKNUMBER_LOG_FILE"
 
 	// The switches of the scripts.
 	switchRegistry  = "PORT_REGISTRY"
@@ -73,6 +75,7 @@ const (
 	// Values already set before the start script runs; it must keep them.
 	keptDatabase = "kept_database"
 	keptTunnel   = "kept-tunnel-value"
+	keptLogFile  = "kept-log-folder/kept.log"
 
 	startedMarker = "fake-checknumber-started"
 	builtMarker   = "fake-checknumber-built"
@@ -95,6 +98,16 @@ esac
 	guideInstallCommand = "scripts/checknumber-autostart.sh install"
 	guideRemoveCommand  = "scripts/checknumber-autostart.sh remove"
 	guideLogFile        = "~/" + wantLogFile
+	// The guide names the start log by its file name and its folder in one
+	// phrase. Written as one path, "/Library/Logs/checknumber/checknumber-start"
+	// is a 43-character run that the guide's key check (C-4, see keyShaped)
+	// reads as a pasted key.
+	startLogName      = "checknumber-start.log"
+	guideStartLogFile = "`" + startLogName + "` in `~/" + wantLogFolder + "/`"
+	// R-30: the size at which the log is set aside and how many older files
+	// are kept, as the guide words them.
+	guideSetAsideSize = "2 MB"
+	guideKeptFiles    = "5 older"
 
 	folderMode     fs.FileMode = 0o755
 	executableMode fs.FileMode = 0o755
@@ -107,7 +120,7 @@ esac
 )
 
 // passedSettings are what the start script must give the program (DD-1).
-var passedSettings = []string{envPort, envEventsPort, envDatabase, envFile, envRecordingsDir, envTunnel}
+var passedSettings = []string{envPort, envEventsPort, envDatabase, envFile, envRecordingsDir, envTunnel, envLogFile}
 
 // secretNames must not appear in a script or in the plist at all (C-3, C-4):
 // the Telnyx keys under both of their names, the check API key and the
@@ -176,7 +189,7 @@ func fakeRepo(t *testing.T, name string) string {
 }
 
 // fakeProgram puts a program in the place of bin/checknumber that prints
-// startedMarker and the six settings it was given. It prints nothing else of
+// startedMarker and the seven settings it was given. It prints nothing else of
 // its environment, so no value of the operator's shell reaches a test log.
 func fakeProgram(t *testing.T, repo string) {
 	t.Helper()
@@ -242,7 +255,7 @@ func givenSettings(output string) (settings map[string]string, ok bool) {
 }
 
 func TestRunScript(t *testing.T) {
-	t.Run("ports from the registry and the four defaults", func(t *testing.T) {
+	t.Run("ports from the registry and the five defaults", func(t *testing.T) {
 		repo, home := fakeRepo(t, "repo"), t.TempDir()
 		fakeProgram(t, repo)
 
@@ -261,6 +274,7 @@ func TestRunScript(t *testing.T) {
 			envFile:          filepath.Join(repo, wantEnvFile),
 			envRecordingsDir: recordings,
 			envTunnel:        tunnelSetting,
+			envLogFile:       filepath.Join(home, wantLogFile),
 		}
 		if !reflect.DeepEqual(got, want) {
 			t.Errorf("settings given to the program = %v, want %v", got, want)
@@ -280,6 +294,7 @@ func TestRunScript(t *testing.T) {
 			envFile+"="+keptEnvFile,
 			envRecordingsDir+"="+keptRecordings,
 			envTunnel+"="+keptTunnel,
+			envLogFile+"="+keptLogFile,
 			envPort+"="+stalePort,
 			envEventsPort+"="+stalePort,
 		)
@@ -297,6 +312,7 @@ func TestRunScript(t *testing.T) {
 			envFile:          keptEnvFile,
 			envRecordingsDir: keptRecordings,
 			envTunnel:        keptTunnel,
+			envLogFile:       keptLogFile,
 		}
 		if !reflect.DeepEqual(got, want) {
 			t.Errorf("settings given to the program = %v, want %v", got, want)
@@ -314,6 +330,7 @@ func TestRunScript(t *testing.T) {
 			envFile+"=",
 			envRecordingsDir+"=",
 			envTunnel+"=",
+			envLogFile+"=",
 		)
 
 		output := mustRun(t, env, filepath.Join(repo, scriptsFolder, runScript))
@@ -328,12 +345,38 @@ func TestRunScript(t *testing.T) {
 			envFile:          "",
 			envRecordingsDir: "",
 			envTunnel:        "",
+			envLogFile:       "",
 		}
 		if !reflect.DeepEqual(got, want) {
 			t.Errorf("settings given to the program = %v, want %v", got, want)
 		}
 		if _, err := os.Stat(filepath.Join(home, wantRecordings)); !errors.Is(err, fs.ErrNotExist) {
 			t.Errorf("the default recordings folder was created although the setting was explicitly empty: %v", err)
+		}
+	})
+
+	t.Run("Telnyx variables of the shell are not passed on", func(t *testing.T) {
+		repo, home := fakeRepo(t, "repo"), t.TempDir()
+		// This fake program prints only how many TELNYX_ variables it was
+		// given, never a name or a value.
+		program := "#!/bin/sh\necho " + startedMarker + "\nenv | awk '/^TELNYX_/{n++} END{print \"telnyx-count=\" n+0}'\n"
+		writeFile(t, filepath.Join(repo, programPath), program, executableMode)
+		env := startEnv(t, home,
+			"TELNYX_API_KEY=shell-key",
+			"TELNYX_PUBLIC_KEY=shell-public-key",
+			"TELNYX_CONNECTION_ID=shell-application",
+			"TELNYX_FROM_NUMBER=shell-number",
+			"TELNYX_TO_NUMBER=shell-other",
+		)
+
+		output := mustRun(t, env, filepath.Join(repo, scriptsFolder, runScript))
+
+		got, started := givenSettings(output)
+		if !started {
+			t.Fatalf("the start script did not start the program; output: %q", output)
+		}
+		if got["telnyx-count"] != "0" {
+			t.Errorf("TELNYX_ variables given to the program = %q, want 0: the Telnyx settings must come from the settings file only", got["telnyx-count"])
 		}
 	})
 
@@ -421,9 +464,11 @@ func TestAutostartPrint(t *testing.T) {
 			if !agent.KeepAlive {
 				t.Error("KeepAlive is not true: the app would not start again when it stops")
 			}
-			logFile := filepath.Join(home, wantLogFile)
-			if agent.StandardOutPath != logFile || agent.StandardErrorPath != logFile {
-				t.Errorf("output path = %q, error path = %q, want both %q", agent.StandardOutPath, agent.StandardErrorPath, logFile)
+			// The app's own log has one writer, the app (TC-45): the login
+			// service writes into the start log.
+			startLog := filepath.Join(home, wantStartLogFile)
+			if agent.StandardOutPath != startLog || agent.StandardErrorPath != startLog {
+				t.Errorf("output path = %q, error path = %q, want both %q", agent.StandardOutPath, agent.StandardErrorPath, startLog)
 			}
 			if len(agent.ProgramArguments) != wantArguments {
 				t.Fatalf("ProgramArguments = %q, want the shell, its flags and one command", agent.ProgramArguments)
@@ -518,9 +563,11 @@ func TestAutostartNoSecretsNoPorts(t *testing.T) {
 	repo, home := fakeRepo(t, "repo"), t.TempDir()
 	plist := mustRun(t, scriptEnv(home), filepath.Join(repo, scriptsFolder, autostartScript), commandPrint)
 	// The two temporary folders are not part of what is checked; their names
-	// hold digits.
+	// hold digits. Nor is the start log's path, which TestAutostartPrint pins
+	// letter for letter: its folders and the name checknumber-start run to
+	// more than 40 key characters.
 	texts := map[string]string{
-		"the plist": strings.NewReplacer(repo, "<repo>", home, "<home>").Replace(plist),
+		"the plist": strings.NewReplacer(filepath.Join(home, wantStartLogFile), "<start log>", repo, "<repo>", home, "<home>").Replace(plist),
 	}
 	for _, script := range []string{runScript, autostartScript} {
 		content, err := os.ReadFile(filepath.Join(scriptsSource, script))
@@ -559,9 +606,19 @@ func TestRunningGuideStartAtLogin(t *testing.T) {
 	}
 	section, _, _ = strings.Cut(section, nextHeading)
 
-	for _, want := range []string{guideInstallCommand, guideRemoveCommand, guideLogFile} {
+	// The file name and folder the guide names are exactly the start log the
+	// plist writes to (TestAutostartPrint).
+	if got := wantLogFolder + "/" + startLogName; got != wantStartLogFile {
+		t.Fatalf("the guide's start log %q is not the plist's %q", got, wantStartLogFile)
+	}
+	for _, want := range []string{guideInstallCommand, guideRemoveCommand, guideLogFile, guideStartLogFile, guideSetAsideSize, guideKeptFiles} {
 		if !strings.Contains(section, want) {
 			t.Errorf("the %q section does not name %q", startAtLoginHeading, want)
 		}
+	}
+	// The guide as a whole holds nothing key-shaped (C-4); the section must
+	// not be the first to break that.
+	if key := keyShaped.FindString(section); key != "" {
+		t.Errorf("the %q section holds a key-shaped value %q", startAtLoginHeading, key)
 	}
 }

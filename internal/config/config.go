@@ -38,6 +38,9 @@ const (
 	// the driver would silently use the database named after the user (D-7).
 	envDatabase = "PGDATABASE"
 	envTunnel   = "CHECKNUMBER_TUNNEL"
+	// envLogFile is the path of the app's log file (TC-44). Optional: unset,
+	// log lines go to standard error.
+	envLogFile = "CHECKNUMBER_LOG_FILE"
 )
 
 // TunnelCloudflared is the one CHECKNUMBER_TUNNEL value besides empty: the app
@@ -125,6 +128,10 @@ type Config struct {
 	// Tunnel is empty or TunnelCloudflared. With TunnelCloudflared PublicURL
 	// may be empty: the tunnel's address is only known once it runs (TC-32).
 	Tunnel string
+	// LogFile, when not empty, is the log file every log line goes to (TC-44).
+	// Any value is accepted: a file that cannot be opened must not stop the
+	// start (AD-7).
+	LogFile string
 }
 
 // Load reads the settings. A missing or bad setting gives one error that
@@ -134,6 +141,7 @@ func Load() (Config, error) {
 	var l loader
 	l.readFile(envFile)
 	apiKey, _ := optional(envCheckAPIKey)
+	logFile, _ := optional(envLogFile)
 	tunnel := l.tunnel(envTunnel)
 	cfg := Config{
 		Port:                l.port(envPort),
@@ -149,6 +157,7 @@ func Load() (Config, error) {
 		APIKey:              apiKey,
 		Database:            l.required(envDatabase),
 		Tunnel:              tunnel,
+		LogFile:             logFile,
 	}
 	if len(l.problems) > 0 {
 		return Config{}, errors.New("config: bad settings: " + strings.Join(l.problems, "; "))

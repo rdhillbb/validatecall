@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"sync"
 	"time"
 
@@ -26,6 +27,26 @@ const saveLimit = 10 * time.Second
 // reasonCancelled is saved with Unknown when the requester left before its
 // turn to dial came.
 const reasonCancelled = "not called: the request was cancelled"
+
+// The check line of R-29 (TC-48), one per request. Free text is Go-quoted so a
+// quote or a line break in it can never split or fake a line; the typed input
+// is never written, so a key pasted by mistake stays out of the log (C-4).
+const (
+	lineAnswered = "check number=%s result=%s source=%s took=%.1fs"
+	lineReason   = " reason=%q"
+	lineFailed   = "check failed number=%s reason=%q took=%.1fs"
+	lineRefused  = "check refused reason=%q took=%.1fs"
+)
+
+// source says where the answer of a check line came from (TC-48).
+type source string
+
+const (
+	sourceCall   source = "call"   // this request dialled or tried to dial
+	sourceShared source = "shared" // it waited for another request's call (AD-5)
+	sourceSaved  source = "saved"  // a saved result, also an International one
+	sourceNone   source = "none"   // an International number saved now
+)
 
 // Dialer places one call and reports its result. Tests use a fake (C-5).
 type Dialer interface {
@@ -75,11 +96,15 @@ type Service struct {
 
 	mu      sync.Mutex
 	flights map[string]*flight
+
+	// logf writes the check lines; tests replace it to read them without
+	// touching the global logger other packages' tests capture.
+	logf func(format string, args ...any)
 }
 
 // NewService returns a Service; now is the clock (a fixed function in tests).
 func NewService(st *store.Store, d Dialer, now func() time.Time) *Service {
-	return &Service{store: st, dialer: d, now: now, flights: map[string]*flight{}}
+	return &Service{store: st, dialer: d, now: now, flights: map[string]*flight{}, logf: log.Printf}
 }
 
 // Check returns the result for input. An invalid number returns the
@@ -88,13 +113,24 @@ func NewService(st *store.Store, d Dialer, now func() time.Time) *Service {
 func (s *Service) Check(ctx context.Context, input string) (answer Answer, err error) {
 	number, international, err := numberOf(input)
 	if err != nil {
+		s.logRefused(err, s.now())
 		return Answer{}, err
 	}
+
+	// The clock is read only once this request holds or has joined the
+	// number's flight: a clock that blocks (as in the tests) must never keep a
+	// second request from joining. Registered first, so it runs after the
+	// panic recovery below and sees the request's final answer and error.
+	var start time.Time
+	waited := false
+	defer func() { s.logCheck(number, answer, err, waited, start) }()
 
 	s.mu.Lock()
 	if f, ok := s.flights[number]; ok {
 		f.waiters++
 		s.mu.Unlock()
+		waited = true
+		start = s.now()
 		select {
 		case <-f.done:
 			answer := f.answer
@@ -122,9 +158,47 @@ func (s *Service) Check(ctx context.Context, input string) (answer Answer, err e
 		s.mu.Unlock()
 		answer, err = f.answer, f.err
 	}()
+	start = s.now()
 	f.answer, f.err = s.check(ctx, number, international)
 
 	return f.answer, f.err
+}
+
+// logCheck writes the line of a request that reached the check. waited is
+// true when the request waited on another request's flight.
+func (s *Service) logCheck(number string, a Answer, err error, waited bool, start time.Time) {
+	took := s.now().Sub(start).Seconds()
+	if err != nil {
+		// Only the error's type: its text may hold more than the line needs.
+		s.logf(lineFailed, number, fmt.Sprintf("%T", err), took)
+		return
+	}
+	src := sourceCall
+	switch {
+	case a.Saved:
+		src = sourceSaved
+	case waited:
+		src = sourceShared
+	case a.Code == result.International:
+		src = sourceNone
+	}
+	if a.Reason == "" {
+		s.logf(lineAnswered, number, a.Code, src, took)
+		return
+	}
+	s.logf(lineAnswered+lineReason, number, a.Code, src, took, a.Reason)
+}
+
+// logRefused writes the line of a refused input (R-24). The error text of
+// phone.Normalize quotes the input, so only the message shown to the person is
+// written.
+func (s *Service) logRefused(err error, start time.Time) {
+	message := fmt.Sprintf("%T", err)
+	var invalid *phone.InvalidError
+	if errors.As(err, &invalid) {
+		message = invalid.Message
+	}
+	s.logf(lineRefused, message, s.now().Sub(start).Seconds())
 }
 
 // numberOf returns input in the form it is saved under: a +1 number, or the
