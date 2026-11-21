@@ -28,6 +28,9 @@ const (
 	secretBody    = "outside the recordings folder"
 	voiceText     = `You have reached a number that has been disconnected. Please check the number <or> dial "again".`
 	unknownReason = "Telnyx could not tell what answered"
+	wordsReason   = "phone company message, see text"
+	goneText      = "This number is not in use. Goodbye"
+	companyText   = "Your call cannot be completed as dialed"
 	savedDays     = 8
 	fileMode      = 0o600
 	dirMode       = 0o700
@@ -293,9 +296,53 @@ func TestUnknownAndPerson(t *testing.T) {
 	person.RecordingPath = recordingName
 	person.Text = voiceText
 	body = wantStatus(t, postCheck(t, NewPage(&fakeChecker{answer: person}, t.TempDir()), testInput), http.StatusOK)
-	wantContains(t, body, `<span class="chip c-warn">Person answered</span><span class="hint">The app hung up. Nothing was recorded.</span>`)
+	wantContains(t, body, `<span class="chip c-warn">Person answered</span><span class="hint">The app hung up. Nothing was kept.</span>`)
 	wantAbsent(t, body, "<audio", recordingName, `id="copy"`, `<blockquote`, "disconnected", "<dt>Reason</dt>",
-		"The next check of this number will dial again.")
+		"The next check of this number will dial again.", "What the message said")
+}
+
+func TestDisconnectedWordsBlock(t *testing.T) {
+	for _, code := range []result.Code{result.Disconnected, result.DisconnectedUnallocated} {
+		t.Run(string(code), func(t *testing.T) {
+			a := answer(code, novemberCall)
+			a.RecordingPath = recordingName
+			a.Text = goneText
+			body := wantStatus(t, postCheck(t, NewPage(&fakeChecker{answer: a}, t.TempDir()), testInput), http.StatusOK)
+
+			wantOrder(t, body,
+				`<span class="chip c-info">`+result.Label(code)+`</span><span class="hint">New call just made</span>`,
+				`<dt>Called</dt><dd>2026-11-13 08:12 (Eastern)</dd></dl>`,
+				`<div class="player"><audio controls preload="metadata" src="/recordings/call-1.mp3"></audio></div>`,
+				`<strong>What the message said</strong><button class="copy" type="button" id="copy">Copy text</button>`,
+				`<blockquote id="txt">This number is not in use. Goodbye</blockquote>`,
+			)
+			wantAbsent(t, body, "<dt>Reason</dt>")
+		})
+	}
+}
+
+func TestUnknownWordsBlock(t *testing.T) {
+	a := answer(result.Unknown, novemberCall)
+	a.Reason = wordsReason
+	a.RecordingPath = recordingName
+	a.Text = companyText
+	body := wantStatus(t, postCheck(t, NewPage(&fakeChecker{answer: a}, t.TempDir()), testInput), http.StatusOK)
+	wantOrder(t, body,
+		`<span class="chip c-bad">Unknown</span><span class="hint">Follow up by hand</span>`,
+		`<dt>Reason</dt><dd>phone company message, see text</dd></dl>`,
+		`<div class="player"><audio controls preload="metadata" src="/recordings/call-1.mp3"></audio></div>`,
+		`<strong>What the message said</strong><button class="copy" type="button" id="copy">Copy text</button>`,
+		`<blockquote id="txt">Your call cannot be completed as dialed</blockquote>`,
+		`<p class="hint">The next check of this number will dial again.</p>`,
+	)
+
+	// An Unknown without words shows as today: its reason, no player and no text.
+	plain := answer(result.Unknown, novemberCall)
+	plain.Reason = unknownReason
+	body = wantStatus(t, postCheck(t, NewPage(&fakeChecker{answer: plain}, t.TempDir()), testInput), http.StatusOK)
+	wantContains(t, body, `<dt>Reason</dt><dd>Telnyx could not tell what answered</dd></dl>`,
+		`<p class="hint">The next check of this number will dial again.</p>`)
+	wantAbsent(t, body, "<audio", `id="copy"`, "<blockquote", "What the message said")
 }
 
 func TestInvalidMessage(t *testing.T) {

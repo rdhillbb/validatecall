@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -669,4 +670,314 @@ func TestDownloadWriterErrorHidesKey(t *testing.T) {
 	if got := fake.only(t); got.auth != "" {
 		t.Errorf("download Authorization = %q; want no Authorization header (D-2)", got.auth)
 	}
+}
+
+// filterLine is "<path>" followed by each query parameter as " name=value",
+// decoded and sorted, so an id that was not query-escaped shows up as extra
+// parameters.
+func filterLine(path string, q url.Values) string {
+	line := path
+	for _, name := range slices.Sorted(maps.Keys(q)) {
+		for _, value := range q[name] {
+			line += " " + name + "=" + value
+		}
+	}
+	return line
+}
+
+func recordingsAPI(t *testing.T, pages map[string]string, deleteStatus int) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			replyJSON(deleteStatus, `{"data":{}}`)(w, r)
+			return
+		}
+		line := filterLine(r.URL.Path, r.URL.Query())
+		page, ok := pages[line]
+		if r.Method != http.MethodGet || !ok {
+			t.Errorf("fake telnyx: unexpected request %s %s", r.Method, line)
+			replyJSON(http.StatusBadRequest, `{"errors":[{"code":"400","detail":"unexpected"}]}`)(w, r)
+			return
+		}
+		replyJSON(http.StatusOK, page)(w, r)
+	}
+}
+
+// requestLines returns every captured request as a sorted "METHOD filterLine"
+// line, and fails the test when one lacks the bearer key.
+func (f *fakeTelnyx) requestLines(t *testing.T) []string {
+	t.Helper()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	lines := make([]string, 0, len(f.requests))
+	for _, r := range f.requests {
+		if r.auth != "Bearer "+fakeKey {
+			t.Errorf("%s %s Authorization = %q; want the bearer key", r.method, r.path, r.auth)
+		}
+		q, err := url.ParseQuery(r.query)
+		if err != nil {
+			t.Errorf("%s %s: query %q does not parse: %v", r.method, r.path, r.query, err)
+		}
+		lines = append(lines, r.method+" "+filterLine(r.path, q))
+	}
+	slices.Sort(lines)
+	return lines
+}
+
+func assertLines(t *testing.T, got, want []string) {
+	t.Helper()
+	slices.Sort(want)
+	if !slices.Equal(got, want) {
+		t.Errorf("requests =\n %q\nwant\n %q", got, want)
+	}
+}
+
+func TestDeleteRecording(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+		ref    RecordingRef
+		want   []string
+	}{
+		{"200 deletes", http.StatusOK, RecordingRef{RecordingID: "rec-1", TranscriptionID: "tr-1"},
+			[]string{"DELETE /recording_transcriptions/tr-1", "DELETE /recordings/rec-1"}},
+		{"404 is already deleted", http.StatusNotFound, RecordingRef{RecordingID: "rec-1", TranscriptionID: "tr-1"},
+			[]string{"DELETE /recording_transcriptions/tr-1", "DELETE /recordings/rec-1"}},
+		{"ids are path-escaped", http.StatusOK, RecordingRef{RecordingID: "rec/1?x", TranscriptionID: "tr 1#y"},
+			[]string{"DELETE /recording_transcriptions/tr%201%23y", "DELETE /recordings/rec%2F1%3Fx"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := newFake(t, recordingsAPI(t, nil, tc.status))
+			c := NewClient(fake.URL, fakeKey, fake.Client())
+
+			if err := c.DeleteRecording(context.Background(), tc.ref); err != nil {
+				t.Fatalf("DeleteRecording error = %v; want nil", err)
+			}
+			assertLines(t, fake.requestLines(t), tc.want)
+		})
+	}
+}
+
+func TestDeleteRecordingPartial(t *testing.T) {
+	t.Run("only the transcription id", func(t *testing.T) {
+		fake := newFake(t, recordingsAPI(t, nil, http.StatusOK))
+		c := NewClient(fake.URL, fakeKey, fake.Client())
+
+		if err := c.DeleteRecording(context.Background(), RecordingRef{TranscriptionID: "tr-1"}); err != nil {
+			t.Fatalf("DeleteRecording error = %v; want nil", err)
+		}
+		assertLines(t, fake.requestLines(t), []string{"DELETE /recording_transcriptions/tr-1"})
+	})
+
+	t.Run("only the recording id", func(t *testing.T) {
+		fake := newFake(t, recordingsAPI(t, map[string]string{
+			"/recording_transcriptions filter[recording_id]=rec-1": `{"data":[{"id":"tr-a"},{"id":"tr-b"}]}`,
+		}, http.StatusOK))
+		c := NewClient(fake.URL, fakeKey, fake.Client())
+
+		if err := c.DeleteRecording(context.Background(), RecordingRef{RecordingID: "rec-1"}); err != nil {
+			t.Fatalf("DeleteRecording error = %v; want nil", err)
+		}
+		assertLines(t, fake.requestLines(t), []string{
+			"GET /recording_transcriptions filter[recording_id]=rec-1",
+			"DELETE /recording_transcriptions/tr-a",
+			"DELETE /recording_transcriptions/tr-b",
+			"DELETE /recordings/rec-1",
+		})
+	})
+
+	t.Run("no id at all", func(t *testing.T) {
+		fake := newFake(t, recordingsAPI(t, nil, http.StatusOK))
+		c := NewClient(fake.URL, fakeKey, fake.Client())
+
+		err := c.DeleteRecording(context.Background(), RecordingRef{})
+		if !errors.Is(err, errNoRecordingID) {
+			t.Fatalf("DeleteRecording error = %v; want %v", err, errNoRecordingID)
+		}
+		if !strings.Contains(err.Error(), "no recording, transcription or call leg id is known") {
+			t.Errorf("error text %q; want it to name that no id is known", err)
+		}
+		if got := fake.requestLines(t); len(got) != 0 {
+			t.Errorf("fake telnyx got %q; want no request", got)
+		}
+	})
+}
+
+func TestDeleteRecordingByLeg(t *testing.T) {
+	cases := []struct {
+		name  string
+		leg   string
+		lists map[string]string
+		want  []string
+	}{
+		{
+			name: "lists and deletes each recording and its transcriptions",
+			leg:  "leg-1",
+			lists: map[string]string{
+				"/recordings filter[call_leg_id]=leg-1":                `{"data":[{"id":"rec-a"},{"id":"rec-b"}]}`,
+				"/recording_transcriptions filter[recording_id]=rec-a": `{"data":[{"id":"tr-a"}]}`,
+				"/recording_transcriptions filter[recording_id]=rec-b": `{"data":[]}`,
+			},
+			want: []string{
+				"GET /recordings filter[call_leg_id]=leg-1",
+				"GET /recording_transcriptions filter[recording_id]=rec-a",
+				"GET /recording_transcriptions filter[recording_id]=rec-b",
+				"DELETE /recording_transcriptions/tr-a",
+				"DELETE /recordings/rec-a",
+				"DELETE /recordings/rec-b",
+			},
+		},
+		{
+			name:  "empty recordings list",
+			leg:   "leg-1",
+			lists: map[string]string{"/recordings filter[call_leg_id]=leg-1": `{"data":[]}`},
+			want:  []string{"GET /recordings filter[call_leg_id]=leg-1"},
+		},
+		{
+			// Unescaped, the "&" would split it into a second parameter x=y.
+			name:  "leg id is query-escaped",
+			leg:   "leg/1&x=y",
+			lists: map[string]string{"/recordings filter[call_leg_id]=leg/1&x=y": `{"data":[]}`},
+			want:  []string{"GET /recordings filter[call_leg_id]=leg/1&x=y"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := newFake(t, recordingsAPI(t, tc.lists, http.StatusOK))
+			c := NewClient(fake.URL, fakeKey, fake.Client())
+
+			if err := c.DeleteRecording(context.Background(), RecordingRef{CallLegID: tc.leg}); err != nil {
+				t.Fatalf("DeleteRecording error = %v; want nil", err)
+			}
+			assertLines(t, fake.requestLines(t), tc.want)
+		})
+	}
+}
+
+func TestDeleteRecordingErrorHidesKey(t *testing.T) {
+	// The fake echoes the Authorization header back, so the key reaches the
+	// client inside the reply and must be removed from the error.
+	echoKey := func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, "failed for "+r.Header.Get("Authorization"))
+	}
+	assertSafe := func(t *testing.T, err error, ops ...string) {
+		t.Helper()
+		if err == nil {
+			t.Fatal("DeleteRecording error = nil; want an error")
+		}
+		text := err.Error()
+		for _, op := range ops {
+			if !strings.Contains(text, op) {
+				t.Errorf("error text %q; want it to name %q", text, op)
+			}
+		}
+		if strings.Contains(text, fakeKey) || !strings.Contains(text, "[redacted]") {
+			t.Errorf("error text was not redacted: %q", text)
+		}
+	}
+
+	t.Run("500 on every delete", func(t *testing.T) {
+		fake := newFake(t, echoKey)
+		c := NewClient(fake.URL, fakeKey, fake.Client())
+
+		err := c.DeleteRecording(context.Background(), RecordingRef{RecordingID: "rec-1", TranscriptionID: "tr-1"})
+		assertSafe(t, err, "delete transcription tr-1", "delete recording rec-1")
+		var apiErr *APIError
+		if !errors.As(err, &apiErr) || apiErr.Status != http.StatusInternalServerError {
+			t.Errorf("error = %v (%T); want *APIError with status 500", err, err)
+		}
+		// Both were tried although the first failed.
+		assertLines(t, fake.requestLines(t), []string{"DELETE /recording_transcriptions/tr-1", "DELETE /recordings/rec-1"})
+	})
+
+	t.Run("500 on the list by leg", func(t *testing.T) {
+		fake := newFake(t, echoKey)
+		c := NewClient(fake.URL, fakeKey, fake.Client())
+
+		err := c.DeleteRecording(context.Background(), RecordingRef{CallLegID: "leg-1"})
+		assertSafe(t, err, "list recordings of call leg leg-1", "status 500")
+		assertLines(t, fake.requestLines(t), []string{"GET /recordings filter[call_leg_id]=leg-1"})
+	})
+
+	t.Run("transport error", func(t *testing.T) {
+		cause := errors.New("transport echoed Bearer " + fakeKey)
+		var requests []string
+		hc := &http.Client{Transport: transportFunc(func(r *http.Request) (*http.Response, error) {
+			requests = append(requests, r.Method+" "+r.URL.EscapedPath())
+			if got := r.Header.Get("Authorization"); got != "Bearer "+fakeKey {
+				t.Errorf("transport got Authorization %q; want the bearer key", got)
+			}
+			return nil, cause
+		})}
+		c := NewClient("https://api.invalid/v2", fakeKey, hc)
+
+		err := c.DeleteRecording(context.Background(), RecordingRef{RecordingID: "rec-1", TranscriptionID: "tr-1"})
+		assertSafe(t, err, "delete transcription tr-1", "delete recording rec-1")
+		if !errors.Is(err, cause) {
+			t.Errorf("original cause lost: %v", err)
+		}
+		assertLines(t, requests, []string{"DELETE /v2/recording_transcriptions/tr-1", "DELETE /v2/recordings/rec-1"})
+	})
+}
+
+func TestDeleteRecordingAcrossPages(t *testing.T) {
+	fake := newFake(t, recordingsAPI(t, map[string]string{
+		"/recordings filter[call_leg_id]=leg-1":                                    `{"data":[{"id":"rec-a"}],"meta":{"page_number":1,"total_pages":2}}`,
+		"/recordings filter[call_leg_id]=leg-1 page[number]=2":                     `{"data":[{"id":"rec-b"}],"meta":{"page_number":2,"total_pages":2}}`,
+		"/recording_transcriptions filter[recording_id]=rec-a":                     `{"data":[]}`,
+		"/recording_transcriptions filter[recording_id]=rec-b":                     `{"data":[{"id":"tr-a"}],"meta":{"cursors":{"after":"token+="},"next":"/v2/recording_transcriptions?page[after]=token%2B%3D"}}`,
+		"/recording_transcriptions filter[recording_id]=rec-b page[after]=token+=": `{"data":[{"id":"tr-b"}],"meta":{"next":null}}`,
+	}, http.StatusOK))
+	c := NewClient(fake.URL, fakeKey, fake.Client())
+
+	if err := c.DeleteRecording(context.Background(), RecordingRef{CallLegID: "leg-1"}); err != nil {
+		t.Fatalf("DeleteRecording: %v", err)
+	}
+	assertLines(t, fake.requestLines(t), []string{
+		"GET /recordings filter[call_leg_id]=leg-1",
+		"GET /recordings filter[call_leg_id]=leg-1 page[number]=2",
+		"GET /recording_transcriptions filter[recording_id]=rec-a",
+		"GET /recording_transcriptions filter[recording_id]=rec-b",
+		"GET /recording_transcriptions filter[recording_id]=rec-b page[after]=token+=",
+		"DELETE /recording_transcriptions/tr-a",
+		"DELETE /recording_transcriptions/tr-b",
+		"DELETE /recordings/rec-a",
+		"DELETE /recordings/rec-b",
+	})
+}
+
+func TestDeleteRecordingReportsIncompleteDiscovery(t *testing.T) {
+	fake := newFake(t, recordingsAPI(t, map[string]string{
+		"/recordings filter[call_leg_id]=leg-1":                `{"data":[{},{"id":"rec-a"},{"id":"rec-b"}]}`,
+		"/recording_transcriptions filter[recording_id]=rec-a": `{}`,
+		"/recording_transcriptions filter[recording_id]=rec-b": `{"data":[{"id":"tr-b"}]}`,
+	}, http.StatusOK))
+	c := NewClient(fake.URL, fakeKey, fake.Client())
+
+	err := c.DeleteRecording(context.Background(), RecordingRef{CallLegID: "leg-1"})
+	if err == nil || !strings.Contains(err.Error(), "list recordings of call leg leg-1: missing id") ||
+		!strings.Contains(err.Error(), "list transcriptions of recording rec-a: missing list data") {
+		t.Errorf("DeleteRecording error = %v; want both discovery errors", err)
+	}
+	assertLines(t, fake.requestLines(t), []string{
+		"GET /recordings filter[call_leg_id]=leg-1",
+		"GET /recording_transcriptions filter[recording_id]=rec-a",
+		"GET /recording_transcriptions filter[recording_id]=rec-b",
+		"DELETE /recording_transcriptions/tr-b",
+		"DELETE /recordings/rec-a",
+		"DELETE /recordings/rec-b",
+	})
+}
+
+func TestDeleteRecordingRejectsDotSegments(t *testing.T) {
+	fake := newFake(t, recordingsAPI(t, nil, http.StatusOK))
+	c := NewClient(fake.URL, fakeKey, fake.Client())
+
+	err := c.DeleteRecording(context.Background(), RecordingRef{RecordingID: "..", TranscriptionID: "."})
+	if err == nil || !strings.Contains(err.Error(), "delete recording ..: invalid resource id") ||
+		!strings.Contains(err.Error(), "delete transcription .: invalid resource id") {
+		t.Errorf("DeleteRecording error = %v; want both invalid ID errors", err)
+	}
+	assertLines(t, fake.requestLines(t), nil)
 }

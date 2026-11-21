@@ -40,10 +40,9 @@ const (
 	day            = 24 * time.Hour
 	msgCheckFailed = "The check could not be completed. Try again."
 
-	// Hints beside the result label, worded as in the approved mockup.
 	hintNewCall  = "New call just made"
 	hintFax      = "A fax machine answered"
-	hintPerson   = "The app hung up. Nothing was recorded."
+	hintPerson   = "The app hung up. Nothing was kept."
 	hintUnknown  = "Follow up by hand"
 	chipOK       = "c-ok"
 	chipWarn     = "c-warn"
@@ -70,6 +69,14 @@ var (
 		result.Fax:            chipOK,
 		result.PersonAnswered: chipWarn,
 		result.Unknown:        chipBad,
+	}
+	// S-3: the results that may carry a recording and its words. C-1: a person
+	// is never among them, so nothing of a person is shown even if it reached the page.
+	wordResults = map[result.Code]bool{
+		result.VoiceMessage:            true,
+		result.Disconnected:            true,
+		result.DisconnectedUnallocated: true,
+		result.Unknown:                 true,
 	}
 )
 
@@ -233,8 +240,7 @@ func toResultView(a check.Answer, now time.Time) *resultView {
 	if a.Saved {
 		v.SavedDays = int(now.Sub(a.CalledAt) / day)
 	}
-	// C-1: only a voice message has a recording and text; a person is never recorded.
-	if a.Code == result.VoiceMessage {
+	if wordResults[a.Code] {
 		if a.RecordingPath != "" {
 			v.Audio = recordingsPrefix + a.RecordingPath
 		}

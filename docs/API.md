@@ -63,8 +63,8 @@ Reply `200`:
 | `result_label` | string | The same result in words, for showing to a person |
 | `called_at` | string | When the call was placed, UTC, RFC 3339. For a saved result this is the time of the earlier call |
 | `saved` | boolean | `true`: no call was placed now; this is the saved result of the call at `called_at`. `false`: a call was just placed |
-| `reason` | string | Filled when `result_code` is `unknown` (why the app could not tell) or `international` (not called). Otherwise empty |
-| `text` | string | Filled only for `voice_message`: the first seconds of the recorded greeting as text, or `not available: <why>`. Otherwise empty |
+| `reason` | string | Filled when `result_code` is `unknown` (why the app could not tell; `phone company message, see text` when it was read from the message's words) or `international` (not called). Otherwise empty |
+| `text` | string | Filled for `voice_message`, and for `disconnected`, `disconnected_unallocated` and `unknown` when the result was read from the message's words: the first seconds of the recording as text, or `not available: <why>` for a voice message. Otherwise empty |
 
 ## Result codes
 
@@ -72,12 +72,12 @@ Reply `200`:
 |---|---|---|
 | `fax` | Fax | The line answered and a fax machine was detected |
 | `voice_message` | Voice message | The line answered with a recorded greeting; see `text` |
-| `person_answered` | Person answered | A live person answered. The app hung up and recorded nothing |
+| `person_answered` | Person answered | A live person answered. The app hung up and kept nothing |
 | `picked_up` | Picked up | The line answered, but the app could not tell what answered |
 | `no_answer` | No answer | The line rang about 5 times (30 seconds) and nobody picked up |
 | `busy` | Busy | The line gave a busy signal |
 | `unallocated` | Unallocated | The phone network says the number does not exist |
-| `disconnected` | Disconnected | The phone network rejected the call |
+| `disconnected` | Disconnected | The phone network rejected the call, or the line answered with a message saying the number is not in use; see `text` |
 | `disconnected_unallocated` | Disconnected / Unallocated | Used in place of the two above when the server is set to combine them |
 | `international` | International | A number of a country other than the US and Canada (it starts with `+` and a country code other than 1). It is saved and never dialled; `reason` is `not called: outside US and Canada`; `called_at` is the time the request was recorded |
 | `unknown` | Unknown | The call failed or ended in a way the app could not classify; see `reason`. Follow up by hand |

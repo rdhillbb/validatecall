@@ -33,11 +33,19 @@ const (
 	reasonTextEmpty       = "transcription was empty"
 	// queryRemoved stands where a recording link's query was (TC-35).
 	queryRemoved = "[redacted]"
+	// logNotDeleted is logged with the call id when a recording that is not
+	// kept could not be deleted at Telnyx (TC-57). It is fixed text: the
+	// returned error can carry Telnyx's reply, and nothing of a person may
+	// reach a log line (C-1, R-37).
+	logNotDeleted = "check: recording of call %s could not be deleted"
 )
 
 const (
 	// TC-36: Telnyx sent the text about 2 seconds after the recording.
 	textWaitLimit = 15 * time.Second
+	// TC-57: after the hang-up the recording-saved event is awaited at most
+	// the text wait plus 10 seconds; later, nothing is known to delete.
+	hangupWaitLimit = textWaitLimit + 10*time.Second
 	// TC-37: the check limit ends a call the runner follows. The margin lets
 	// Telnyx end a call the app lost track of (D-6) without cutting short one
 	// that is still followed.
@@ -54,6 +62,7 @@ type Commands interface {
 	StartRecording(ctx context.Context, id string) error
 	Hangup(ctx context.Context, id string) error
 	Download(ctx context.Context, url string, w io.Writer) error
+	DeleteRecording(ctx context.Context, ref telnyx.RecordingRef) error
 }
 
 var (
@@ -91,6 +100,8 @@ type Runner struct {
 	late map[string]*lateCall
 	// A completed recording can be redelivered even after every expected event
 	// arrived. Later calls therefore need identity on their recording events.
+	// Every answered call is recorded, so this is set by the first answered
+	// call (TC-63).
 	recordingHistory bool
 	// dialing counts Dial requests still waiting for their call id. Events
 	// that arrive meanwhile are kept in early, because Telnyx can report a
@@ -231,7 +242,8 @@ func (r *Runner) unidentified(ev telnyx.Event) bool {
 
 // soleOwner reports that exactly one call can own an unidentified event:
 // one call is in progress (calls never overlap, AD-2) and no earlier call
-// attempted recording. Clearing late does not rule out webhook redelivery.
+// was answered, so none was recorded (TC-63). Clearing late does not rule out
+// webhook redelivery.
 func (r *Runner) soleOwner() bool {
 	return len(r.calls) == 1 && !r.recordingHistory && len(r.late) == 0
 }
@@ -314,11 +326,11 @@ func (r *Runner) endDial(id string, d *dialFlight) (c *callEvents, shutdown cont
 // forget ends call id. If Telnyx may still send its recording or
 // transcription (awaited), the call moves to late so those events are
 // recognised and dropped instead of reaching the next call.
-func (r *Runner) forget(id string, c *callEvents, recording, text, machine bool) {
+func (r *Runner) forget(id string, c *callEvents, recording, text, answered bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.calls, id)
-	r.recordingHistory = r.recordingHistory || machine
+	r.recordingHistory = r.recordingHistory || answered
 	l := &lateCall{keys: c.keys, recording: recording, text: text}
 	// Events queued after the result was reached have arrived too.
 	for _, ev := range c.queue {
@@ -389,7 +401,7 @@ func (r *Runner) Call(ctx context.Context, number string) Outcome {
 
 	// Once the call exists it must still be ended and its recording kept,
 	// even if the requester stops waiting (C-1, TC-4).
-	f := &callFlow{runner: r, ctx: callCtx, id: id}
+	f := &callFlow{runner: r, ctx: callCtx, id: id, noRecording: reasonRecordingLate}
 	if shutdown == nil {
 		close(dial.done)
 	} else {
@@ -417,7 +429,7 @@ func (r *Runner) Call(ctx context.Context, number string) Outcome {
 	}
 	out := f.follow(c)
 	recording, text := f.awaited()
-	r.forget(id, c, recording, text, f.machine)
+	r.forget(id, c, recording, text, f.answered)
 	out.StartedAt = startedAt
 	return out
 }
@@ -476,28 +488,44 @@ type callFlow struct {
 	id     string
 	out    Outcome
 
+	// answered is set by call.answered, when the record command goes out (TC-53).
 	answered bool
-	// machine is set once detection said machine and recording was asked for.
-	machine bool
+	// recorded is set once the record command succeeded. What detection said
+	// is kept apart in detected, detCode and detReason: the two were one flag
+	// while recording started only for a machine.
+	recorded bool
+	// noRecording is the reason a voice message gets when nothing was recorded.
+	noRecording string
+	detected    bool
+	detCode     result.Code
+	detReason   string
+	// farEnded is set by the far end's hang-up after the answer; the check then
+	// no longer waits for detection (TC-55).
+	farEnded bool
 	// ended is set once the call is over or a hang-up was sent.
-	ended         bool
-	recordingDone bool
-	textDone      bool
-	// recording is set while Telnyx may send recording events: from a
-	// successful StartRecording until a recording error.
-	recording bool
-	// noText is the reason given when the call ends without text. It is set
-	// once recording has started.
-	noText string
-	// textWait fires when the wait for the text is over (TC-36). It is nil,
-	// which never fires, until the recording was saved or its download failed.
-	textWait <-chan time.Time
+	ended bool
+	// recordingDone is set by the recording-saved event (saved) or a recording
+	// error (failed).
+	recordingDone, saved, failed bool
+	recordingURL                 string
+	// textDone is set by the transcription (hasText) or by a recording error,
+	// after which no transcription follows.
+	textDone, hasText bool
+	text              string
+	// What DeleteRecording names (S-2): the transcription event's ids and the
+	// call's leg id.
+	recordingID, transcriptionID, legID string
+	// textWait fires when the wait for the text is over (TC-36); hangupWait when
+	// the wait for the recording after the hang-up is over (TC-57). A nil
+	// channel never fires. textLate and hangupLate record that they fired.
+	textWait, hangupWait <-chan time.Time
+	textLate, hangupLate bool
 }
 
 // awaited reports whether Telnyx may still send the recording and the
 // transcription of the call.
 func (f *callFlow) awaited() (recording, text bool) {
-	if !f.recording {
+	if !f.recorded {
 		return false, false
 	}
 	return !f.recordingDone, !f.textDone
@@ -507,18 +535,24 @@ func (f *callFlow) follow(c *callEvents) Outcome {
 	for {
 		select {
 		case <-c.wake:
+		case <-f.textWait:
+			f.textWait, f.textLate = nil, true
+		case <-f.hangupWait:
+			f.hangupWait, f.hangupLate = nil, true
+		case <-f.ctx.Done():
+			// Events queued before the limit ran out still count.
 			if f.handleAll(c) {
 				return f.out
 			}
-			continue
-		case <-f.textWait:
-		case <-f.ctx.Done():
+			return f.expire()
 		}
-		// Events queued before the wait or the limit ran out still count.
+		// Events queued before a wait ran out still count.
 		if f.handleAll(c) {
 			return f.out
 		}
-		return f.expire()
+		if f.ready() {
+			return f.decide()
+		}
 	}
 }
 
@@ -531,97 +565,207 @@ func (f *callFlow) handleAll(c *callEvents) bool {
 	return false
 }
 
-// handle applies one event and reports whether the call has its result.
+// handle applies one event and reports whether the call has its result
+// without a recording to wait for.
 func (f *callFlow) handle(ev telnyx.Event) bool {
+	if f.legID == "" {
+		f.legID = ev.CallLegID
+	}
 	switch ev.Type {
 	case telnyx.EventCallAnswered:
-		f.answered = true
-	case telnyx.EventCallHangup:
-		if f.machine {
-			// The recording is saved when the far end hangs up; keep waiting for it.
-			f.ended = true
-			return false
-		}
 		if f.answered {
-			// Answered but ended before detection finished: detection gave no answer (R-20).
-			f.out.Code, f.out.Reason = result.FromDetection("")
-		} else {
-			f.out.Code, f.out.Reason = result.FromHangup(ev.HangupCause, ev.SIPHangupCause, f.runner.cfg.Combine)
-		}
-		return true
-	case telnyx.EventMachinePremiumDetectionEnded:
-		if f.machine {
 			return false
 		}
-		f.out.Code, f.out.Reason = result.FromDetection(ev.DetectionResult)
-		if f.out.Code != result.VoiceMessage {
-			// C-1, TC-5: only a machine is ever recorded.
-			f.hangup()
-			return true
-		}
-		f.machine = true
+		f.answered = true
+		// R-33: every answered call records its first seconds.
 		if err := f.runner.cmd.StartRecording(f.ctx, f.id); err != nil {
-			f.out.Text = textNotAvailable + reasonRecordingStart + err.Error()
+			// The response body can contain private data and detection has
+			// not necessarily classified the call yet (C-1, TC-53).
+			var apiErr *telnyx.APIError
+			if errors.As(err, &apiErr) {
+				log.Printf("check: start recording of call %s failed: status %d", f.id, apiErr.Status)
+			} else {
+				log.Printf("check: start recording of call %s failed", f.id)
+			}
+			f.noRecording = reasonRecordingStart + err.Error()
+			if f.detected {
+				return f.decideByDetection()
+			}
+			return false
+		}
+		f.recorded = true
+	case telnyx.EventCallHangup:
+		f.ended, f.farEnded = true, true
+		if !f.answered {
+			if f.detected {
+				return f.decideByDetection()
+			}
+			f.out.Code, f.out.Reason = result.FromHangup(ev.HangupCause, ev.SIPHangupCause, f.runner.cfg.Combine)
+			return true
+		}
+		if f.recorded {
+			f.awaitAfterHangup()
+		}
+	case telnyx.EventMachinePremiumDetectionEnded:
+		if f.detected {
+			return false
+		}
+		f.detected = true
+		f.detCode, f.detReason = result.FromDetection(ev.DetectionResult)
+		// A machine detection can be delivered before the answer webhook.
+		// Wait for the answer to start recording (TC-53).
+		if !f.answered && f.detCode == result.VoiceMessage {
+			return false
+		}
+		if !f.recorded {
+			return f.decideByDetection()
+		}
+		// Silence, fax, not sure and a person end at once (TC-55); a machine
+		// once its 10 seconds are saved (TC-4).
+		if f.detCode != result.VoiceMessage || f.recordingDone {
 			f.hangup()
-			return true
+			f.awaitAfterHangup()
 		}
-		f.recording = true
-		f.noText = reasonRecordingLate
 	case telnyx.EventRecordingSaved:
-		if !f.machine || f.recordingDone {
+		if !f.recorded || f.recordingDone {
 			return false
 		}
-		f.recordingDone = true
-		// The 10 seconds are kept (TC-4); nothing more of the call is needed.
-		f.hangup()
-		f.noText = reasonTextLate
-		if err := f.download(ev.RecordingURL); err != nil {
-			// D-3: a failed download neither ends the check nor replaces the
-			// text. It is logged because text that arrives leaves it no
-			// other place.
-			failure := withoutQuery(err.Error(), ev.RecordingURL)
-			log.Printf("check: %s", failure)
-			f.noText = reasonDownloadFailed + failure
+		f.recordingDone, f.saved, f.recordingURL = true, true, ev.RecordingURL
+		// From here the text wait bounds the check, not the hang-up wait.
+		f.hangupWait = nil
+		if f.detected {
+			// The 10 seconds are kept (TC-4); nothing more of the call is needed.
+			f.hangup()
 		}
-		if f.textDone {
-			return true
-		}
-		f.textWait = f.runner.cfg.After(textWaitLimit)
-	case telnyx.EventRecordingError:
-		if !f.machine || f.recordingDone {
-			return false
-		}
-		// D-3: text that arrived is kept.
 		if !f.textDone {
-			f.out.Text = textNotAvailable + reasonRecordingFailed
+			f.textWait = f.runner.cfg.After(textWaitLimit)
 		}
-		f.recording = false
-		f.hangup()
-		return true
-	case telnyx.EventTranscriptionSaved:
-		if !f.machine || f.textDone {
+	case telnyx.EventRecordingError:
+		if !f.recorded || f.recordingDone {
 			return false
 		}
-		f.textDone = true
-		f.out.Text = channelPrefix.ReplaceAllString(ev.TranscriptionText, "")
-		if f.out.Text == "" {
-			f.out.Text = textNotAvailable + reasonTextEmpty
+		f.recordingDone, f.failed, f.textDone = true, true, true
+		if f.detected {
+			f.hangup()
 		}
-		return f.recordingDone
+	case telnyx.EventTranscriptionSaved:
+		if !f.recorded || f.textDone {
+			return false
+		}
+		f.textDone, f.hasText = true, true
+		f.text = channelPrefix.ReplaceAllString(ev.TranscriptionText, "")
+		f.recordingID, f.transcriptionID = ev.RecordingID, ev.TranscriptionID
 	}
 	return false
 }
 
-// expire ends a call whose time limit or text wait ran out (TC-19, TC-21,
-// TC-36).
-func (f *callFlow) expire() Outcome {
+// awaitAfterHangup starts the wait for the recording once the call is over,
+// unless detection already gave a result that keeps it: without a recording
+// event there is nothing known to delete (TC-57).
+func (f *callFlow) awaitAfterHangup() {
+	if f.hangupWait != nil || f.hangupLate || f.recordingDone || f.detCode == result.VoiceMessage {
+		return
+	}
+	f.hangupWait = f.runner.cfg.After(hangupWaitLimit)
+}
+
+// ready reports that the result can be decided (TC-55): detection's result or
+// the far end's hang-up, the recording (or its error) and the text (or the
+// end of the text wait) are in, in any order; or the hang-up wait is over.
+func (f *callFlow) ready() bool {
+	if !f.recordingDone {
+		return f.hangupLate || (f.farEnded && !f.recorded)
+	}
+	return (f.detected || f.farEnded) && f.recordingDone && (f.textDone || f.textLate)
+}
+
+// decideByDetection gives detection's result for a call that is not recorded.
+func (f *callFlow) decideByDetection() bool {
+	f.out.Code, f.out.Reason = f.detCode, f.detReason
+	if f.detCode == result.VoiceMessage {
+		f.out.Text = textNotAvailable + f.noRecording
+	}
 	f.hangup()
-	if !f.machine {
-		return Outcome{Code: result.Unknown, Reason: reasonNoEvents}
+	return true
+}
+
+// decide gives the result of a recorded call and keeps or deletes its
+// recording (TC-55 to TC-57).
+func (f *callFlow) decide() Outcome {
+	f.hangup()
+	f.out.Code, f.out.Reason = result.FromDetection("")
+	if f.detected {
+		f.out.Code, f.out.Reason = f.detCode, f.detReason
 	}
-	if !f.textDone {
-		f.out.Text = textNotAvailable + f.noText
+	fromWords := false
+	// Only the words of a saved recording are read, never a person's (R-37, TC-61).
+	if f.saved && f.hasText && f.out.Code != result.PersonAnswered {
+		if code, reason, ok := result.FromWords(f.text, f.runner.cfg.Combine); ok {
+			f.out.Code, f.out.Reason, fromWords = code, reason, true
+		}
 	}
+	if fromWords || f.out.Code == result.VoiceMessage {
+		f.keep()
+	} else {
+		f.discard()
+	}
+	return f.out
+}
+
+// keep downloads the recording and keeps the text, or the reason it is not
+// available (S-3, TC-22).
+func (f *callFlow) keep() {
+	noText := reasonRecordingLate
+	switch {
+	case f.failed:
+		noText = reasonRecordingFailed
+	case f.saved:
+		noText = reasonTextLate
+		if err := f.download(f.recordingURL); err != nil {
+			// D-3: a failed download does not replace the text. It is logged
+			// because text that arrived leaves it no other place.
+			failure := withoutQuery(err.Error(), f.recordingURL)
+			log.Printf("check: %s", failure)
+			noText = reasonDownloadFailed + failure
+		}
+	}
+	switch {
+	case !f.hasText:
+		f.out.Text = textNotAvailable + noText
+	case f.text == "":
+		f.out.Text = textNotAvailable + reasonTextEmpty
+	default:
+		f.out.Text = f.text
+	}
+}
+
+// discard keeps nothing of the call: no download and no text, and its
+// recording and transcription are deleted at Telnyx (R-37, TC-57, C-1).
+func (f *callFlow) discard() {
+	if !f.recorded {
+		return
+	}
+	if !f.recordingDone && !f.hasText {
+		log.Printf(logNotDeleted, f.id)
+		return
+	}
+	ref := telnyx.RecordingRef{RecordingID: f.recordingID, TranscriptionID: f.transcriptionID, CallLegID: f.legID}
+	// Finish the privacy cleanup before returning, even if the call limit fired.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(f.ctx), f.runner.cfg.Limit)
+	defer cancel()
+	if err := f.runner.cmd.DeleteRecording(ctx, ref); err != nil {
+		log.Printf(logNotDeleted, f.id)
+	}
+}
+
+// expire ends a call whose time limit ran out (TC-19, TC-21, TC-36).
+func (f *callFlow) expire() Outcome {
+	if f.detected || f.farEnded {
+		return f.decide()
+	}
+	f.hangup()
+	f.out.Code, f.out.Reason = result.Unknown, reasonNoEvents
+	f.discard()
 	return f.out
 }
 
@@ -632,8 +776,7 @@ func (f *callFlow) hangup() {
 		return
 	}
 	f.ended = true
-	// Cleanup must be sent with a live context even when the call limit fired.
-	// It is bounded separately, and cannot hold up the timed-out request.
+	// Hangup needs a live context at the limit without holding up the result.
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(f.ctx), f.runner.cfg.Limit)
 	done := make(chan struct{})
 	go func() {
@@ -667,12 +810,20 @@ func (f *callFlow) download(url string) error {
 	if filepath.Base(name) != name {
 		return fmt.Errorf("call id %q is not a plain file name", f.id)
 	}
+	ctx := f.ctx
+	if ctx.Err() != nil {
+		// A check ended by its time limit still keeps its recording; a
+		// download already running at the limit is cancelled with the call.
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(context.WithoutCancel(f.ctx), f.runner.cfg.Limit)
+		defer cancel()
+	}
 	path := filepath.Join(f.runner.cfg.RecordingsDir, name)
 	file, err := os.Create(path)
 	if err != nil {
 		return fmt.Errorf("create recording of call %s: %w", f.id, err)
 	}
-	err = f.runner.cmd.Download(f.ctx, url, file)
+	err = f.runner.cmd.Download(ctx, url, file)
 	if closeErr := file.Close(); err == nil {
 		err = closeErr
 	}

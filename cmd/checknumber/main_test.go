@@ -554,6 +554,8 @@ func (c *fakeCommands) Hangup(context.Context, string) error { return errNoCall 
 
 func (c *fakeCommands) Download(context.Context, string, io.Writer) error { return errNoCall }
 
+func (c *fakeCommands) DeleteRecording(context.Context, telnyx.RecordingRef) error { return errNoCall }
+
 func (c *fakeCommands) dialled() []telnyx.DialRequest {
 	c.mu.Lock()
 	defer c.mu.Unlock()

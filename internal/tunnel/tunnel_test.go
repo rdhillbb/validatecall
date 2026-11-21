@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -20,6 +21,10 @@ const (
 
 	// scriptHead makes the script write its process id to its first argument.
 	scriptHead = "#!/bin/sh\necho $$ > \"$1\"\n"
+	// slowHead makes the script wait, before it writes its process id, until
+	// the test opens the named pipe that is its second argument. The shell
+	// itself waits, so ending it leaves no child of the script behind.
+	slowHead = "#!/bin/sh\n: < \"$2\"\necho $$ > \"$1\"\n"
 	// stayAlive replaces the shell with sleep, so the process id stays the
 	// same and ending the program leaves no child of the script behind.
 	stayAlive = "exec sleep 30\n"
@@ -35,6 +40,8 @@ const (
 	// shortened wait of DD-2, long enough for the script to write its id.
 	exitWait  = 20 * time.Second
 	shortWait = time.Second
+	// quickWait is a start wait that ends while a slowHead script still waits.
+	quickWait = 100 * time.Millisecond
 	// doneWait bounds how long a test waits for Done after the program ended.
 	doneWait = 10 * time.Second
 	// Exceeds Scanner's default token limit; tunnel output has no line-size contract.
@@ -47,17 +54,35 @@ const (
 // runs is ended and reported, so no test leaves a process behind.
 func fakeProgram(t *testing.T, body string) (program string, args []string) {
 	t.Helper()
+	return fakeScript(t, scriptHead+body)
+}
+
+// slowFakeProgram is a fakeProgram that stays alive but writes its process id
+// only after the test opens the pipe named by the last of args.
+func slowFakeProgram(t *testing.T) (program string, args []string) {
+	t.Helper()
+	program, args = fakeScript(t, slowHead+stayAlive)
+	pipe := filepath.Join(t.TempDir(), "go-on")
+	if err := syscall.Mkfifo(pipe, 0o600); err != nil {
+		t.Fatalf("make the fake program's pipe: %v", err)
+	}
+	return program, append(args, pipe)
+}
+
+// fakeScript writes script into the test's temp folder; see fakeProgram.
+func fakeScript(t *testing.T, script string) (program string, args []string) {
+	t.Helper()
 	dir := t.TempDir()
 	program = filepath.Join(dir, "fake-tunnel")
-	if err := os.WriteFile(program, []byte(scriptHead+body), 0o700); err != nil {
+	if err := os.WriteFile(program, []byte(script), 0o700); err != nil {
 		t.Fatalf("write fake program: %v", err)
 	}
 	pidFile := filepath.Join(dir, "pid")
 	t.Cleanup(func() {
-		if _, err := os.Stat(pidFile); errors.Is(err, fs.ErrNotExist) {
+		pid, running := leftRunning(t, []string{pidFile})
+		if !running {
 			return
 		}
-		pid := programID(t, []string{pidFile})
 		// Wait4 answers 0 only for a child of this test process that still
 		// runs, so the signal cannot reach any other process.
 		if got, _ := syscall.Wait4(pid, nil, syscall.WNOHANG, nil); got == 0 {
@@ -73,15 +98,67 @@ func fakeProgram(t *testing.T, body string) (program string, args []string) {
 // programID reads the process id the script wrote.
 func programID(t *testing.T, args []string) int {
 	t.Helper()
+	pid, written := readID(t, args)
+	if !written {
+		t.Fatalf("the fake program did not write its complete process id to %s", args[0])
+	}
+	return pid
+}
+
+// readID reads the process id the script wrote, and reports false while the
+// script has not written all of it yet.
+func readID(t *testing.T, args []string) (pid int, written bool) {
+	t.Helper()
 	raw, err := os.ReadFile(args[0])
+	if errors.Is(err, fs.ErrNotExist) {
+		return 0, false
+	}
 	if err != nil {
 		t.Fatalf("read the fake program's process id: %v", err)
 	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	// echo ends the id with a newline; until then the file is empty or partial.
+	if !strings.HasSuffix(string(raw), "\n") {
+		return 0, false
+	}
+	pid, err = strconv.Atoi(strings.TrimSpace(string(raw)))
 	if err != nil {
 		t.Fatalf("fake program's process id %q: %v", raw, err)
 	}
-	return pid
+	return pid, true
+}
+
+func leftRunning(t *testing.T, args []string) (pid int, running bool) {
+	t.Helper()
+	if pid, written := readID(t, args); written {
+		return pid, exists(pid)
+	}
+
+	// These tests run serially with at most one fake tunnel child at a time.
+	// Its parent PID identifies it even before the shell can write its own ID.
+	ctx, cancel := context.WithTimeout(context.Background(), exitWait)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "ps", "-axo", "pid=,ppid=")
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("list processes to check the fake tunnel: %v", err)
+	}
+	columns := strings.Fields(string(out))
+	if len(columns)%2 != 0 {
+		t.Fatal("process listing did not contain PID and parent PID pairs")
+	}
+	parent := strconv.Itoa(os.Getpid())
+	listing := strconv.Itoa(cmd.Process.Pid)
+	for i := 0; i < len(columns); i += 2 {
+		if columns[i+1] != parent || columns[i] == listing {
+			continue
+		}
+		pid, err := strconv.Atoi(columns[i])
+		if err != nil {
+			t.Fatalf("read the fake tunnel's process id from ps: %v", err)
+		}
+		return pid, true
+	}
+	return 0, false
 }
 
 // exists reports whether process pid is still there. A program that was
@@ -244,11 +321,67 @@ func TestStartFails(t *testing.T) {
 			if !strings.Contains(err.Error(), program) {
 				t.Errorf("start error %q does not name the program %s", err, program)
 			}
-			if pid := programID(t, args); exists(pid) {
+			if pid, running := leftRunning(t, args); running {
 				t.Errorf("program %d still exists after start failed", pid)
 			}
 		})
 	}
+}
+
+// On a busy machine the start wait can end before the script has written its
+// process id; the check of TestStartFails must still hold.
+func TestStartFailsBeforeProgramID(t *testing.T) {
+	t.Run("ended before it wrote its id", func(t *testing.T) {
+		program, args := slowFakeProgram(t)
+
+		tun, err := start(context.Background(), program, args, quickWait)
+		if tun != nil {
+			t.Cleanup(tun.Stop)
+		}
+
+		if tun != nil || !errors.Is(err, errNoAddress) {
+			t.Fatalf("start = %v, %v; want no tunnel and %q", tun, err, errNoAddress)
+		}
+		if pid, running := leftRunning(t, args); running {
+			t.Errorf("program %d still exists after start failed", pid)
+		}
+		if _, written := readID(t, args); written {
+			t.Errorf("the program wrote its process id; want it ended before that")
+		}
+	})
+
+	t.Run("left running", func(t *testing.T) {
+		program, args := slowFakeProgram(t)
+		// Keep the FIFO closed to model a leaked child which cannot publish its PID.
+		cmd := exec.Command(program, args...)
+		if err := cmd.Start(); err != nil {
+			t.Fatalf("run the fake program: %v", err)
+		}
+		t.Cleanup(func() {
+			if err := cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+				t.Errorf("end the fake program: %v", err)
+				return
+			}
+			var exitErr *exec.ExitError
+			if err := cmd.Wait(); err != nil && !errors.As(err, &exitErr) {
+				t.Errorf("reap the fake program: %v", err)
+			}
+		})
+		if _, written := readID(t, args); written {
+			t.Fatal("the program wrote its process id before the FIFO opened")
+		}
+		if pid, running := leftRunning(t, args); !running || pid != cmd.Process.Pid {
+			t.Errorf("leftRunning before PID file = %d, %t; want live program %d", pid, running, cmd.Process.Pid)
+		}
+
+		// Exercise the recorded-PID path with the same child and no scheduler handshake.
+		if err := os.WriteFile(args[0], []byte(strconv.Itoa(cmd.Process.Pid)+"\n"), 0o600); err != nil {
+			t.Fatalf("write the live program's process id: %v", err)
+		}
+		if pid, running := leftRunning(t, args); !running || pid != cmd.Process.Pid {
+			t.Errorf("leftRunning with PID file = %d, %t; want live program %d", pid, running, cmd.Process.Pid)
+		}
+	})
 }
 
 func TestStartFailsWithoutProgram(t *testing.T) {

@@ -5,12 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"checknumber/internal/result"
@@ -48,7 +50,20 @@ const (
 	// TC-36 and TC-37, written out here so a changed runner constant fails.
 	runnerTextWait      = 15 * time.Second
 	runnerTimeLimitSecs = 150
+	// TC-57: the text wait plus 10 seconds after the hang-up.
+	runnerHangupWait = 25 * time.Second
+	// The ids a recording's events carry, and what DeleteRecording gets (S-2).
+	runnerLeg             = "leg-call-one"
+	runnerRecordingID     = "rec-call-one"
+	runnerTranscriptionID = "tr-call-one"
+	// D-11: the carrier message before the far end hangs up.
+	disconnectedWords = "This number is not in use. Goodbye"
+	// The fixed line logged when a recording cannot be deleted (R-37).
+	notDeletedLine = "check: recording of call " + runnerCallID + " could not be deleted"
 )
+
+// runnerRef is what DeleteRecording gets once the transcription arrived.
+var runnerRef = telnyx.RecordingRef{RecordingID: runnerRecordingID, TranscriptionID: runnerTranscriptionID, CallLegID: runnerLeg}
 
 var runnerStart = time.Date(2026, 11, 2, 15, 0, 0, 0, time.UTC)
 
@@ -59,11 +74,13 @@ type fakeCommands struct {
 	dialErr       error
 	recordErr     error
 	downloadErr   error
+	deleteErr     error
 	onDial        func()
 	dialBlock     func(context.Context) error
 	recordBlock   func(context.Context) error
 	hangupBlock   func(context.Context) error
 	downloadBlock func(context.Context) error
+	deleteBlock   func(context.Context) error
 
 	dialed chan struct{}
 	hungup chan struct{}
@@ -73,6 +90,7 @@ type fakeCommands struct {
 	records   []string
 	hangups   []string
 	downloads []string
+	deletes   []telnyx.RecordingRef
 }
 
 func newFakeCommands() *fakeCommands {
@@ -130,6 +148,23 @@ func (f *fakeCommands) Download(ctx context.Context, url string, w io.Writer) er
 	return f.downloadErr
 }
 
+func (f *fakeCommands) DeleteRecording(ctx context.Context, ref telnyx.RecordingRef) error {
+	f.mu.Lock()
+	f.deletes = append(f.deletes, ref)
+	f.mu.Unlock()
+	if f.deleteBlock != nil {
+		return f.deleteBlock(ctx)
+	}
+	return f.deleteErr
+}
+
+// deleted returns a copy of the DeleteRecording requests.
+func (f *fakeCommands) deleted() []telnyx.RecordingRef {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]telnyx.RecordingRef(nil), f.deletes...)
+}
+
 // snapshot returns copies of the recorded commands.
 func (f *fakeCommands) snapshot() (records, hangups, downloads []string) {
 	f.mu.Lock()
@@ -147,21 +182,23 @@ type runnerHarness struct {
 	asked  chan time.Duration
 	// wait is the channel After hands out for runnerTextWait; waitAsked gets
 	// a token when the runner asks for it.
-	wait      chan time.Time
-	waitAsked chan struct{}
-	done      chan Outcome
+	wait       chan time.Time
+	waitAsked  chan struct{}
+	hangupWait chan time.Time
+	done       chan Outcome
 }
 
 func newRunnerHarness(t *testing.T, cmd *fakeCommands, combine bool) *runnerHarness {
 	t.Helper()
 	h := &runnerHarness{
-		cmd:       cmd,
-		dir:       t.TempDir(),
-		limit:     make(chan time.Time),
-		asked:     make(chan time.Duration, 1),
-		wait:      make(chan time.Time),
-		waitAsked: make(chan struct{}, 1),
-		done:      make(chan Outcome, 1),
+		cmd:        cmd,
+		dir:        t.TempDir(),
+		limit:      make(chan time.Time),
+		asked:      make(chan time.Duration, 1),
+		wait:       make(chan time.Time),
+		waitAsked:  make(chan struct{}, 1),
+		hangupWait: make(chan time.Time),
+		done:       make(chan Outcome, 1),
 	}
 	h.runner = NewRunner(cmd, RunnerConfig{
 		From:          runnerFrom,
@@ -171,13 +208,16 @@ func newRunnerHarness(t *testing.T, cmd *fakeCommands, combine bool) *runnerHarn
 		Limit:         runnerLimit,
 		Combine:       combine,
 		After: func(d time.Duration) <-chan time.Time {
-			if d == runnerTextWait {
-				// Not every test reads the token, and a harness can place two calls.
+			// Not every test reads a token, and a harness can place two calls.
+			switch d {
+			case runnerTextWait:
 				select {
 				case h.waitAsked <- struct{}{}:
 				default:
 				}
 				return h.wait
+			case runnerHangupWait:
+				return h.hangupWait
 			}
 			h.asked <- d
 			return h.limit
@@ -210,6 +250,29 @@ func (h *runnerHarness) detection(value string) {
 	h.event(telnyx.EventMachinePremiumDetectionEnded, func(ev *telnyx.Event) { ev.DetectionResult = value })
 }
 
+// answered, saved and transcribed send the events of an answered, recorded
+// call with the ids Telnyx gives them.
+func (h *runnerHarness) answered() {
+	h.event(telnyx.EventCallAnswered, func(ev *telnyx.Event) { ev.CallLegID = runnerLeg })
+}
+
+func (h *runnerHarness) saved() {
+	h.event(telnyx.EventRecordingSaved, func(ev *telnyx.Event) {
+		ev.CallLegID, ev.RecordingURL = runnerLeg, recordingLink
+	})
+}
+
+func (h *runnerHarness) transcribed(text string) {
+	h.event(telnyx.EventTranscriptionSaved, func(ev *telnyx.Event) {
+		ev.CallLegID, ev.TranscriptionText = runnerLeg, text
+		ev.RecordingID, ev.TranscriptionID = runnerRecordingID, runnerTranscriptionID
+	})
+}
+
+func (h *runnerHarness) farHangup() {
+	h.event(telnyx.EventCallHangup, func(ev *telnyx.Event) { ev.HangupCause, ev.SIPHangupCause = "normal_clearing", "200" })
+}
+
 func (h *runnerHarness) fireLimit(t *testing.T) {
 	t.Helper()
 	select {
@@ -236,6 +299,17 @@ func (h *runnerHarness) fireWait(t *testing.T) {
 	case h.wait <- runnerStart.Add(runnerTextWait):
 	case <-time.After(runnerWait):
 		t.Fatalf("runner is not in the %v text wait", runnerTextWait)
+	}
+}
+
+// fireHangupWait ends the wait for the recording after the hang-up. It
+// succeeds only while the runner waits on it.
+func (h *runnerHarness) fireHangupWait(t *testing.T) {
+	t.Helper()
+	select {
+	case h.hangupWait <- runnerStart.Add(runnerHangupWait):
+	case <-time.After(runnerWait):
+		t.Fatalf("runner is not in the %v wait after the hang-up", runnerHangupWait)
 	}
 }
 
@@ -294,6 +368,59 @@ func awaitHangup(t *testing.T, cmd *fakeCommands) {
 	}
 }
 
+func assertDeletes(t *testing.T, cmd *fakeCommands, want []telnyx.RecordingRef) {
+	t.Helper()
+	if got := cmd.deleted(); !reflect.DeepEqual(got, want) {
+		t.Errorf("DeleteRecording calls = %+v, want %+v", got, want)
+	}
+}
+
+// logBuffer is a log destination that runner goroutines may write to while
+// the test reads it.
+type logBuffer struct {
+	mu   sync.Mutex
+	text strings.Builder
+}
+
+func (b *logBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.text.Write(p)
+}
+
+// lines returns the logged lines, without the newline.
+func (b *logBuffer) lines() []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return strings.Split(strings.TrimSuffix(b.text.String(), "\n"), "\n")
+}
+
+// captureLog sends the standard logger, without its date prefix, to a buffer
+// until the test ends.
+func captureLog(t *testing.T) *logBuffer {
+	t.Helper()
+	buf := &logBuffer{}
+	out, flags := log.Writer(), log.Flags()
+	log.SetOutput(buf)
+	log.SetFlags(0)
+	t.Cleanup(func() {
+		log.SetOutput(out)
+		log.SetFlags(flags)
+	})
+	return buf
+}
+
+// assertLog checks the captured lines; want nil means nothing was logged.
+func assertLog(t *testing.T, buf *logBuffer, want []string) {
+	t.Helper()
+	if want == nil {
+		want = []string{""}
+	}
+	if got := buf.lines(); !reflect.DeepEqual(got, want) {
+		t.Errorf("log lines = %q, want %q", got, want)
+	}
+}
+
 func assertNoFiles(t *testing.T, dir string) {
 	t.Helper()
 	entries, err := os.ReadDir(dir)
@@ -321,10 +448,14 @@ func TestFaxAndSilence(t *testing.T) {
 			cmd := newFakeCommands()
 			h := newRunnerHarness(t, cmd, false)
 			h.start(t)
-			h.event(telnyx.EventCallAnswered, nil)
+			h.answered()
 			h.detection(tc.detection)
+			// The recording started on the answer ends with the hang-up (TC-55).
+			h.saved()
+			h.transcribed("Hello? Hello?")
 			assertOutcome(t, h.outcome(t), tc.want)
-			assertCommands(t, cmd, nil, oneCall, nil)
+			assertCommands(t, cmd, oneCall, oneCall, nil)
+			assertDeletes(t, cmd, []telnyx.RecordingRef{runnerRef})
 			assertNoFiles(t, h.dir)
 			wantDial := []telnyx.DialRequest{{
 				To: runnerNumber, From: runnerFrom, ConnectionID: runnerConnection, WebhookURL: runnerWebhook,
@@ -345,13 +476,18 @@ func TestPersonNeverRecorded(t *testing.T) {
 			cmd := newFakeCommands()
 			h := newRunnerHarness(t, cmd, false)
 			h.start(t)
-			h.event(telnyx.EventCallAnswered, nil)
+			h.answered()
 			h.detection(detection)
+			// The seconds recorded from the answer are deleted unread (R-37):
+			// a greeting phrase in them must not turn the result into Voice message.
+			h.saved()
+			h.transcribed(greeting)
 			assertOutcome(t, h.outcome(t), Outcome{Code: result.PersonAnswered})
 			// Late recording events for the finished call must not be acted on.
 			h.event(telnyx.EventRecordingSaved, func(ev *telnyx.Event) { ev.RecordingURL = recordingLink })
 			h.detection("machine")
-			assertCommands(t, cmd, nil, oneCall, nil)
+			assertCommands(t, cmd, oneCall, oneCall, nil)
+			assertDeletes(t, cmd, []telnyx.RecordingRef{runnerRef})
 			assertNoFiles(t, h.dir)
 		})
 	}
@@ -533,6 +669,7 @@ func TestTextKeptWhenRecordingFails(t *testing.T) {
 	cmd := newFakeCommands()
 	h := newRunnerHarness(t, cmd, false)
 	h.start(t)
+	h.event(telnyx.EventCallAnswered, nil)
 	h.detection("machine")
 	h.event(telnyx.EventTranscriptionSaved, func(ev *telnyx.Event) { ev.TranscriptionText = greeting })
 	h.event(telnyx.EventRecordingError, nil)
@@ -603,6 +740,7 @@ func TestChannelPrefixRemoved(t *testing.T) {
 			cmd := newFakeCommands()
 			h := newRunnerHarness(t, cmd, false)
 			h.start(t)
+			h.event(telnyx.EventCallAnswered, nil)
 			h.detection("machine")
 			h.event(telnyx.EventRecordingSaved, func(ev *telnyx.Event) { ev.RecordingURL = recordingLink })
 			h.event(telnyx.EventTranscriptionSaved, func(ev *telnyx.Event) { ev.TranscriptionText = tc.text })
@@ -661,6 +799,7 @@ func followedCall(t *testing.T, cmd *fakeCommands) *runnerHarness {
 	}
 	h := newRunnerHarness(t, cmd, false)
 	h.start(t)
+	h.event(telnyx.EventCallAnswered, nil)
 	h.detection("machine")
 	select {
 	case <-recording:
@@ -914,6 +1053,7 @@ func TestEventsRouted(t *testing.T) {
 		cmd := newFakeCommands()
 		h := newRunnerHarness(t, cmd, false)
 		h.start(t)
+		h.event(telnyx.EventCallAnswered, nil)
 		h.detection("machine")
 		h.runner.HandleEvent(telnyx.Event{Type: telnyx.EventRecordingSaved, RecordingURL: recordingLink})
 		h.runner.HandleEvent(telnyx.Event{Type: telnyx.EventTranscriptionSaved, CallControlID: runnerOtherID, TranscriptionText: "other call"})
@@ -934,10 +1074,12 @@ func TestEventsRouted(t *testing.T) {
 			}()
 		}
 		wg.Wait()
-		h.event(telnyx.EventCallAnswered, nil)
+		h.answered()
 		h.detection("human_business")
+		h.saved()
+		h.transcribed(greeting)
 		assertOutcome(t, h.outcome(t), Outcome{Code: result.PersonAnswered})
-		assertCommands(t, cmd, nil, oneCall, nil)
+		assertCommands(t, cmd, oneCall, oneCall, nil)
 		h.runner.mu.Lock()
 		defer h.runner.mu.Unlock()
 		if len(h.runner.calls) != 0 || h.runner.dialing != 0 {
@@ -992,9 +1134,12 @@ func TestTimeLimitDuringCommands(t *testing.T) {
 			h.start(t)
 			switch operation {
 			case "record", "download":
+				h.event(telnyx.EventCallAnswered, nil)
 				h.detection("machine")
 				if operation == "download" {
 					h.event(telnyx.EventRecordingSaved, func(ev *telnyx.Event) { ev.RecordingURL = recordingLink })
+					// The download waits until the result is decided (TC-57).
+					h.fireWait(t)
 				}
 			case "hangup":
 				h.detection("fax_detected")
@@ -1161,6 +1306,7 @@ func TestEventsRoutedEarlyRecording(t *testing.T) {
 	cmd := newFakeCommands()
 	h := newRunnerHarness(t, cmd, false)
 	cmd.onDial = func() {
+		h.event(telnyx.EventCallAnswered, nil)
 		h.detection("machine")
 		h.runner.HandleEvent(telnyx.Event{Type: telnyx.EventRecordingSaved, RecordingURL: recordingLink})
 		h.runner.HandleEvent(telnyx.Event{Type: telnyx.EventTranscriptionSaved, TranscriptionText: greeting})
@@ -1196,6 +1342,7 @@ func TestVoiceMessageRejectsPreviousTranscription(t *testing.T) {
 	h := newRunnerHarness(t, cmd, false)
 	h.start(t)
 	<-h.asked
+	h.event(telnyx.EventCallAnswered, nil)
 	h.detection("machine")
 	h.event(telnyx.EventRecordingSaved, func(ev *telnyx.Event) { ev.RecordingURL = recordingLink })
 	h.fireLimit(t)
@@ -1210,6 +1357,7 @@ func TestVoiceMessageRejectsPreviousTranscription(t *testing.T) {
 	cmd.id = runnerOtherID
 	h.start(t)
 	<-h.asked
+	h.runner.HandleEvent(telnyx.Event{Type: telnyx.EventCallAnswered, CallControlID: runnerOtherID})
 	h.runner.HandleEvent(telnyx.Event{
 		Type: telnyx.EventMachinePremiumDetectionEnded, CallControlID: runnerOtherID, DetectionResult: "machine",
 	})
@@ -1290,6 +1438,7 @@ func TestVoiceMessageRejectsCompletedCallRedelivery(t *testing.T) {
 			h := newRunnerHarness(t, cmd, false)
 			h.start(t)
 			<-h.asked
+			h.event(telnyx.EventCallAnswered, nil)
 			h.detection("machine")
 			h.event(telnyx.EventRecordingSaved, func(ev *telnyx.Event) { ev.RecordingURL = recordingLink })
 			h.event(telnyx.EventTranscriptionSaved, func(ev *telnyx.Event) { ev.TranscriptionText = greeting })
@@ -1305,6 +1454,7 @@ func TestVoiceMessageRejectsCompletedCallRedelivery(t *testing.T) {
 			cmd.id = runnerOtherID
 			feed := func() {
 				const leg = "current-call-leg"
+				h.runner.HandleEvent(telnyx.Event{Type: telnyx.EventCallAnswered, CallControlID: runnerOtherID, CallLegID: leg})
 				h.runner.HandleEvent(telnyx.Event{Type: telnyx.EventMachinePremiumDetectionEnded, CallControlID: runnerOtherID, CallLegID: leg, DetectionResult: "machine"})
 				// Redelivery is possible after the first call has both artifacts.
 				h.runner.HandleEvent(telnyx.Event{Type: telnyx.EventTranscriptionSaved, TranscriptionText: "previous call's duplicate"})
@@ -1336,4 +1486,484 @@ func TestVoiceMessageRejectsCompletedCallRedelivery(t *testing.T) {
 			}
 		})
 	}
+}
+
+// step is one event a test sends, in the order the test fixes.
+type step func(*runnerHarness)
+
+func detected(value string) step { return func(h *runnerHarness) { h.detection(value) } }
+
+func transcript(text string) step { return func(h *runnerHarness) { h.transcribed(text) } }
+
+var (
+	answer     step = (*runnerHarness).answered
+	saveRec    step = (*runnerHarness).saved
+	farHangup  step = (*runnerHarness).farHangup
+	recFailure step = func(h *runnerHarness) { h.event(telnyx.EventRecordingError, nil) }
+)
+
+// D-11 (R-33, R-34): the line answers, plays its message and hangs up before
+// detection gives a result.
+func TestDisconnectedMessage(t *testing.T) {
+	logged := captureLog(t)
+	cmd := newFakeCommands()
+	h := newRunnerHarness(t, cmd, false)
+	h.start(t)
+	h.answered()
+	h.farHangup()
+	h.saved()
+	h.transcribed(disconnectedWords)
+	name := runnerCallID + ".mp3"
+	assertOutcome(t, h.outcome(t), Outcome{Code: result.Disconnected, Text: disconnectedWords, RecordingPath: name})
+	// The far end ended the call, so no hang-up is sent; the recording is kept.
+	assertCommands(t, cmd, oneCall, nil, []string{recordingLink})
+	assertDeletes(t, cmd, nil)
+	data, err := os.ReadFile(filepath.Join(h.dir, name))
+	if err != nil || string(data) != recordingBytes {
+		t.Fatalf("recording = %q, %v; want %q", data, err, recordingBytes)
+	}
+	assertLog(t, logged, nil)
+}
+
+// R-33, TC-53: the record command goes out when the answer is reported, before
+// detection; a machine whose words hold no phrase stays Voice message with its
+// text (R-36, R-13).
+func TestRecordOnAnswer(t *testing.T) {
+	const noPhrase = "Hi, this is Sam. Talk soon."
+	cmd := newFakeCommands()
+	recording := make(chan struct{})
+	cmd.recordBlock = func(context.Context) error {
+		close(recording)
+		return nil
+	}
+	h := newRunnerHarness(t, cmd, false)
+	h.start(t)
+	h.answered()
+	select {
+	case <-recording:
+	case <-time.After(runnerWait):
+		t.Fatal("no record command after the answer")
+	}
+	// Nothing but the answer has been sent: no detection started the recording.
+	if records, hangups, _ := cmd.snapshot(); !reflect.DeepEqual(records, oneCall) || len(hangups) != 0 {
+		t.Fatalf("after the answer: StartRecording = %q, Hangup = %q; want %q and none", records, hangups, oneCall)
+	}
+	h.detection("machine")
+	h.saved()
+	h.transcribed(noPhrase)
+	assertOutcome(t, h.outcome(t), Outcome{Code: result.VoiceMessage, Text: noPhrase, RecordingPath: runnerCallID + ".mp3"})
+	assertCommands(t, cmd, oneCall, oneCall, []string{recordingLink})
+	assertDeletes(t, cmd, nil)
+}
+
+// TC-55, TC-61: the result does not depend on whether the text or detection
+// comes first; after the hang-up a detection result that arrives before the
+// decision is applied, and one after the result cannot change it.
+func TestEventOrders(t *testing.T) {
+	const notAvailable = "The person you are calling is not available, please leave a message after the tone"
+	name := runnerCallID + ".mp3"
+	kept := func(code result.Code, text string) Outcome {
+		return Outcome{Code: code, Text: text, RecordingPath: name}
+	}
+	cases := []struct {
+		name    string
+		steps   []step
+		want    Outcome
+		hangups []string
+		deletes []telnyx.RecordingRef
+	}{
+		{"greeting, text after detection", []step{answer, detected("machine"), saveRec, transcript(notAvailable)},
+			kept(result.VoiceMessage, notAvailable), oneCall, nil},
+		{"greeting, text before detection", []step{answer, saveRec, transcript(notAvailable), detected("machine")},
+			kept(result.VoiceMessage, notAvailable), oneCall, nil},
+		{"number gone, text after detection", []step{answer, detected("machine"), saveRec, transcript(disconnectedWords)},
+			kept(result.Disconnected, disconnectedWords), oneCall, nil},
+		{"number gone, text before detection", []step{answer, saveRec, transcript(disconnectedWords), detected("machine")},
+			kept(result.Disconnected, disconnectedWords), oneCall, nil},
+		{"fax after the hang-up", []step{answer, farHangup, detected("fax_detected"), saveRec, transcript("Goodbye")},
+			Outcome{Code: result.Fax}, nil, []telnyx.RecordingRef{runnerRef}},
+		{"machine after the hang-up", []step{answer, farHangup, detected("machine"), saveRec, transcript("Goodbye")},
+			kept(result.VoiceMessage, "Goodbye"), nil, nil},
+		{"person after the hang-up", []step{answer, farHangup, detected("human_residence"), saveRec, transcript(disconnectedWords)},
+			Outcome{Code: result.PersonAnswered}, nil, []telnyx.RecordingRef{runnerRef}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := newFakeCommands()
+			h := newRunnerHarness(t, cmd, false)
+			h.start(t)
+			for _, s := range tc.steps {
+				s(h)
+			}
+			assertOutcome(t, h.outcome(t), tc.want)
+			var downloads []string
+			if tc.want.RecordingPath != "" {
+				downloads = []string{recordingLink}
+			} else {
+				assertNoFiles(t, h.dir)
+			}
+			assertCommands(t, cmd, oneCall, tc.hangups, downloads)
+			assertDeletes(t, cmd, tc.deletes)
+		})
+	}
+
+	t.Run("machine detection delivered before answer", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			cmd := newFakeCommands()
+			h := newRunnerHarness(t, cmd, false)
+			h.start(t)
+			h.detection("machine")
+			synctest.Wait()
+			h.pending(t)
+			assertCommands(t, cmd, nil, nil, nil)
+
+			h.answered()
+			h.saved()
+			h.transcribed(disconnectedWords)
+			assertOutcome(t, h.outcome(t), kept(result.Disconnected, disconnectedWords))
+			assertCommands(t, cmd, oneCall, oneCall, []string{recordingLink})
+		})
+	})
+
+	t.Run("recording queued when hang-up wait expires", func(t *testing.T) {
+		cmd := newFakeCommands()
+		h := newRunnerHarness(t, cmd, false)
+		f := callFlow{runner: h.runner, ctx: context.Background(), id: runnerCallID}
+		f.handle(telnyx.Event{Type: telnyx.EventCallAnswered, CallLegID: runnerLeg})
+		f.handle(telnyx.Event{Type: telnyx.EventCallHangup})
+
+		// Model follow selecting the timer just before draining a queued save.
+		f.hangupWait, f.hangupLate = nil, true
+		f.handle(telnyx.Event{Type: telnyx.EventRecordingSaved, RecordingURL: recordingLink})
+		if f.ready() {
+			t.Fatal("hang-up timer ended the check before the saved recording's text wait")
+		}
+		f.handle(telnyx.Event{Type: telnyx.EventTranscriptionSaved, TranscriptionText: disconnectedWords})
+		if !f.ready() {
+			t.Fatal("the check did not decide once the recording and its text arrived")
+		}
+		got := f.decide()
+		got.StartedAt = runnerStart
+		assertOutcome(t, got, kept(result.Disconnected, disconnectedWords))
+		assertCommands(t, cmd, oneCall, nil, []string{recordingLink})
+		assertDeletes(t, cmd, nil)
+	})
+
+	t.Run("known text waits for detection or far-end hang-up", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			cmd := newFakeCommands()
+			h := newRunnerHarness(t, cmd, false)
+			h.start(t)
+			h.answered()
+			h.saved()
+			h.transcribed(disconnectedWords)
+			synctest.Wait()
+			h.pending(t)
+			assertCommands(t, cmd, oneCall, nil, nil)
+
+			h.detection("human_residence")
+			assertOutcome(t, h.outcome(t), Outcome{Code: result.PersonAnswered})
+			assertCommands(t, cmd, oneCall, oneCall, nil)
+			assertDeletes(t, cmd, []telnyx.RecordingRef{runnerRef})
+		})
+	})
+
+	t.Run("detection after the result", func(t *testing.T) {
+		cmd := newFakeCommands()
+		downloading, release := make(chan struct{}), make(chan struct{})
+		// The download runs once the result is decided; it is held so the
+		// detection is queued before Call returns.
+		cmd.downloadBlock = func(context.Context) error {
+			close(downloading)
+			<-release
+			return nil
+		}
+		h := newRunnerHarness(t, cmd, false)
+		h.start(t)
+		for _, s := range []step{answer, farHangup, saveRec, transcript(disconnectedWords)} {
+			s(h)
+		}
+		select {
+		case <-downloading:
+		case <-time.After(runnerWait):
+			t.Fatal("the decided result was never downloaded")
+		}
+		// A person applied now would mean no download and a delete.
+		h.detection("human_residence")
+		close(release)
+		assertOutcome(t, h.outcome(t), kept(result.Disconnected, disconnectedWords))
+		h.detection("human_residence")
+		assertCommands(t, cmd, oneCall, nil, []string{recordingLink})
+		assertDeletes(t, cmd, nil)
+	})
+}
+
+// R-34 to R-36, R-23, TC-54, TC-56: after a saved recording, matching words
+// decide for machine, silence, fax and not-sure; a recording error leaves
+// detection's result (TC-55).
+func TestWordsDecide(t *testing.T) {
+	const (
+		greetingWords = "Please leave a message after the tone"
+		carrierWords  = "Your call cannot be completed as dialed"
+	)
+	name := runnerCallID + ".mp3"
+	phrases := []struct {
+		name    string
+		text    string
+		combine bool
+		want    Outcome
+	}{
+		{"number gone", disconnectedWords, false, Outcome{Code: result.Disconnected}},
+		{"number gone combined", disconnectedWords, true, Outcome{Code: result.DisconnectedUnallocated}},
+		{"greeting", greetingWords, false, Outcome{Code: result.VoiceMessage}},
+		{"phone company", carrierWords, false, Outcome{Code: result.Unknown, Reason: "phone company message, see text"}},
+	}
+	for _, detection := range []string{"machine", "silence", "fax_detected", "not_sure"} {
+		for _, p := range phrases {
+			t.Run(detection+" "+p.name, func(t *testing.T) {
+				cmd := newFakeCommands()
+				h := newRunnerHarness(t, cmd, p.combine)
+				h.start(t)
+				h.answered()
+				h.detection(detection)
+				h.saved()
+				// Only the words after Telnyx's channel label are read (S-1).
+				h.transcribed("Channel 0: " + p.text)
+				want := p.want
+				want.Text, want.RecordingPath = p.text, name
+				assertOutcome(t, h.outcome(t), want)
+				assertCommands(t, cmd, oneCall, oneCall, []string{recordingLink})
+				assertDeletes(t, cmd, nil)
+			})
+		}
+	}
+
+	errorCases := []struct {
+		detection string
+		want      Outcome
+		deletes   []telnyx.RecordingRef
+	}{
+		{"fax_detected", Outcome{Code: result.Fax}, []telnyx.RecordingRef{runnerRef}},
+		// D-3: the text of a voice message is kept, but its words do not decide.
+		{"machine", Outcome{Code: result.VoiceMessage, Text: disconnectedWords}, nil},
+	}
+	for _, tc := range errorCases {
+		t.Run(tc.detection+" recording error", func(t *testing.T) {
+			cmd := newFakeCommands()
+			h := newRunnerHarness(t, cmd, false)
+			h.start(t)
+			h.answered()
+			h.detection(tc.detection)
+			h.transcribed(disconnectedWords)
+			h.event(telnyx.EventRecordingError, nil)
+			assertOutcome(t, h.outcome(t), tc.want)
+			assertCommands(t, cmd, oneCall, oneCall, nil)
+			assertDeletes(t, cmd, tc.deletes)
+			assertNoFiles(t, h.dir)
+		})
+	}
+}
+
+// R-37, C-1, TC-57: a person's seconds are never downloaded, shown or logged,
+// and are deleted at Telnyx; without a recording event in the wait one fixed
+// line is logged and the result is the same.
+func TestPersonDeleted(t *testing.T) {
+	cases := []struct {
+		name      string
+		detection string
+		deleteErr error
+		after     func(*testing.T, *runnerHarness)
+		deletes   []telnyx.RecordingRef
+		log       []string
+	}{
+		{
+			name: "deleted at Telnyx", detection: "human_residence",
+			after: func(_ *testing.T, h *runnerHarness) {
+				h.saved()
+				h.transcribed(disconnectedWords)
+			},
+			deletes: []telnyx.RecordingRef{runnerRef},
+		},
+		{
+			name: "text wait ends", detection: "human_business",
+			after: func(t *testing.T, h *runnerHarness) {
+				h.saved()
+				h.fireWait(t)
+			},
+			// The recording-saved event carries no recording id; the leg finds it (TC-58).
+			deletes: []telnyx.RecordingRef{{CallLegID: runnerLeg}},
+		},
+		{
+			name: "no recording event in the wait", detection: "human_residence",
+			after:   func(t *testing.T, h *runnerHarness) { h.fireHangupWait(t) },
+			deletes: nil,
+			log:     []string{notDeletedLine},
+		},
+		{
+			// TO-0002:ADV-1: the error can carry Telnyx's reply; only the fixed line is logged.
+			name: "delete refused", detection: "human_residence",
+			deleteErr: errors.New("telnyx delete recording rec-call-one: status 500: " + disconnectedWords),
+			after: func(_ *testing.T, h *runnerHarness) {
+				h.saved()
+				h.transcribed(disconnectedWords)
+			},
+			deletes: []telnyx.RecordingRef{runnerRef},
+			log:     []string{notDeletedLine},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			logged := captureLog(t)
+			cmd := newFakeCommands()
+			cmd.deleteErr = tc.deleteErr
+			h := newRunnerHarness(t, cmd, false)
+			h.start(t)
+			h.answered()
+			h.detection(tc.detection)
+			// The app hangs up as today and waits for the recording.
+			awaitHangup(t, cmd)
+			h.pending(t)
+			tc.after(t, h)
+			assertOutcome(t, h.outcome(t), Outcome{Code: result.PersonAnswered})
+			records, hangups, downloads := cmd.snapshot()
+			if !reflect.DeepEqual(records, oneCall) || !reflect.DeepEqual(hangups, oneCall) || len(downloads) != 0 {
+				t.Errorf("StartRecording = %q, Hangup = %q, Download = %q; want one, one, none", records, hangups, downloads)
+			}
+			assertDeletes(t, cmd, tc.deletes)
+			assertNoFiles(t, h.dir)
+			assertLog(t, logged, tc.log)
+		})
+	}
+
+	t.Run("deletion finishes before return at the check limit", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			cmd := newFakeCommands()
+			started, release := make(chan error, 1), make(chan struct{})
+			cmd.deleteBlock = func(ctx context.Context) error {
+				started <- ctx.Err()
+				select {
+				case <-release:
+					return nil
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
+			h := newRunnerHarness(t, cmd, false)
+			h.start(t)
+			h.answered()
+			h.detection("human_residence")
+			h.saved()
+			synctest.Wait()
+			h.fireLimit(t)
+			select {
+			case err := <-started:
+				if err != nil {
+					t.Errorf("DeleteRecording started with a cancelled context: %v", err)
+				}
+			case <-time.After(runnerWait):
+				t.Fatal("DeleteRecording never started")
+			}
+			synctest.Wait()
+			select {
+			case out := <-h.done:
+				close(release)
+				t.Fatalf("call returned before deletion finished: %+v", out)
+			default:
+				close(release)
+			}
+			assertOutcome(t, h.outcome(t), Outcome{Code: result.PersonAnswered})
+			assertCommands(t, cmd, oneCall, oneCall, nil)
+			assertDeletes(t, cmd, []telnyx.RecordingRef{{CallLegID: runnerLeg}})
+			assertNoFiles(t, h.dir)
+		})
+	})
+}
+
+// R-38, R-37, TC-57: silence, fax, not sure or no detection with words that
+// hold no phrase give today's result; nothing is downloaded or kept, and the
+// recording is deleted at Telnyx.
+func TestUnrecognisedDeleted(t *testing.T) {
+	const noPhrase = "Hello? Hello? Goodbye"
+	couldNotTell := Outcome{Code: result.Unknown, Reason: "Telnyx could not tell what answered"}
+	cases := []struct {
+		name    string
+		steps   []step
+		want    Outcome
+		hangups []string
+	}{
+		{"silence", []step{answer, detected("silence"), saveRec, transcript(noPhrase)}, Outcome{Code: result.PickedUp}, oneCall},
+		{"fax", []step{answer, detected("fax_detected"), saveRec, transcript(noPhrase)}, Outcome{Code: result.Fax}, oneCall},
+		{"not sure", []step{answer, detected("not_sure"), saveRec, transcript(noPhrase)}, couldNotTell, oneCall},
+		{"no detection", []step{answer, farHangup, saveRec, transcript(noPhrase)}, couldNotTell, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			logged := captureLog(t)
+			cmd := newFakeCommands()
+			h := newRunnerHarness(t, cmd, false)
+			h.start(t)
+			for _, s := range tc.steps {
+				s(h)
+			}
+			assertOutcome(t, h.outcome(t), tc.want)
+			assertCommands(t, cmd, oneCall, tc.hangups, nil)
+			assertDeletes(t, cmd, []telnyx.RecordingRef{runnerRef})
+			assertNoFiles(t, h.dir)
+			assertLog(t, logged, nil)
+		})
+	}
+}
+
+// TC-53: a failed record command is logged; the call goes on and detection
+// decides as today, with no word check and nothing to delete.
+func TestRecordCommandFails(t *testing.T) {
+	const failureLog = "check: start recording of call " + runnerCallID + " failed"
+	refusal := errors.New("telnyx record_start: status 422")
+	privateRefusal := &telnyx.APIError{Status: 422, Detail: disconnectedWords + " " + recordingLink}
+	cases := []struct {
+		name      string
+		detection string
+		recordErr error
+		want      Outcome
+		log       string
+	}{
+		{"silence", "silence", refusal, Outcome{Code: result.PickedUp}, failureLog},
+		{"machine", "machine", refusal, Outcome{Code: result.VoiceMessage, Text: "not available: recording could not start: " + refusal.Error()}, failureLog},
+		{"person", "human_residence", privateRefusal, Outcome{Code: result.PersonAnswered}, failureLog + ": status 422"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			logged := captureLog(t)
+			cmd := newFakeCommands()
+			cmd.recordErr = tc.recordErr
+			h := newRunnerHarness(t, cmd, false)
+			h.start(t)
+			h.answered()
+			// Words that would read Disconnected if they were checked.
+			h.transcribed(disconnectedWords)
+			h.detection(tc.detection)
+			assertOutcome(t, h.outcome(t), tc.want)
+			assertCommands(t, cmd, oneCall, oneCall, nil)
+			assertDeletes(t, cmd, nil)
+			assertNoFiles(t, h.dir)
+			assertLog(t, logged, []string{tc.log})
+		})
+	}
+
+	t.Run("detection queued after hang-up", func(t *testing.T) {
+		logged := captureLog(t)
+		cmd := newFakeCommands()
+		cmd.recordErr = refusal
+		h := newRunnerHarness(t, cmd, false)
+		cmd.onDial = func() {
+			h.answered()
+			h.farHangup()
+			h.detection("human_residence")
+		}
+		h.start(t)
+		assertOutcome(t, h.outcome(t), Outcome{Code: result.PersonAnswered})
+		assertCommands(t, cmd, oneCall, nil, nil)
+		assertDeletes(t, cmd, nil)
+		assertLog(t, logged, []string{failureLog})
+	})
 }

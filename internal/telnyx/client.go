@@ -1,7 +1,8 @@
-// Package telnyx sends the four Telnyx Call Control commands the product uses
-// (TS-2): dial, start recording, hang up, and download a recording.
+// Package telnyx sends the five Telnyx commands the product uses (TS-2): dial,
+// start recording, hang up, download a recording, and delete a recording with
+// its transcription (R-37, TC-58).
 // It uses plain net/http instead of the Telnyx Go library (deviation from TC-1,
-// recorded in TO-0004): only four endpoints are needed and go.mod stays as is.
+// recorded in TO-0004): only a few endpoints are needed and go.mod stays as is.
 // Parameter names follow the Telnyx API reference read 2026-11-13.
 package telnyx
 
@@ -14,6 +15,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 )
 
@@ -55,6 +57,16 @@ const (
 	// the recording that was asked for.
 	maxRecordingBytes = 5 << 20
 	redacted          = "[redacted]"
+)
+
+// Recordings API paths and list filters (TC-58), read 2026-11-21.
+const (
+	recordingsPath     = "/recordings"
+	transcriptionsPath = "/recording_transcriptions"
+	filterCallLegID    = "filter[call_leg_id]"
+	filterRecordingID  = "filter[recording_id]"
+	pageNumberParam    = "page[number]"
+	pageAfterParam     = "page[after]"
 )
 
 // Client sends Call Control commands to one Telnyx API base URL.
@@ -131,6 +143,19 @@ type recordBody struct {
 	TranscriptionLanguage string `json:"transcription_language"`
 }
 
+type listReply struct {
+	Data []struct {
+		ID string `json:"id"`
+	} `json:"data"`
+	Meta struct {
+		TotalPages int    `json:"total_pages"`
+		Next       string `json:"next"`
+		Cursors    struct {
+			After string `json:"after"`
+		} `json:"cursors"`
+	} `json:"meta"`
+}
+
 type errorReply struct {
 	Errors []struct {
 		Code   string `json:"code"`
@@ -154,7 +179,7 @@ func (c *Client) Dial(ctx context.Context, req DialRequest) (string, error) {
 	}
 	op := fmt.Sprintf("dial %s", req.To)
 	var reply dialReply
-	if err := c.post(ctx, op, callsPath, body, &reply); err != nil {
+	if err := c.send(ctx, op, http.MethodPost, callsPath, body, &reply); err != nil {
 		return "", err
 	}
 	if reply.Data.CallControlID == "" {
@@ -180,6 +205,114 @@ func (c *Client) StartRecording(ctx context.Context, callControlID string) error
 // Hangup ends the call.
 func (c *Client) Hangup(ctx context.Context, callControlID string) error {
 	return c.action(ctx, callControlID, actionHangup, struct{}{})
+}
+
+// RecordingRef names what of one call is deleted at Telnyx. The
+// transcription-saved event carries RecordingID and TranscriptionID; the
+// recording-saved event documents neither, so CallLegID lets the client find
+// the recording by listing (TC-58).
+type RecordingRef struct {
+	RecordingID, TranscriptionID, CallLegID string
+}
+
+var errNoRecordingID = errors.New("no recording, transcription or call leg id is known")
+
+// DeleteRecording deletes the call's recordings and their transcriptions at
+// Telnyx (R-37, C-1). Recording ids are ref.RecordingID, else those listed by
+// ref.CallLegID; transcription ids are ref.TranscriptionID, else those listed
+// by each recording id. Every delete is tried and the errors are joined. A 404
+// means already deleted, and an empty list is no error.
+func (c *Client) DeleteRecording(ctx context.Context, ref RecordingRef) error {
+	if ref == (RecordingRef{}) {
+		return fmt.Errorf("telnyx delete recording: %w", errNoRecordingID)
+	}
+	var errs []error
+	var recordingIDs []string
+	switch {
+	case ref.RecordingID != "":
+		recordingIDs = []string{ref.RecordingID}
+	case ref.CallLegID != "":
+		var err error
+		recordingIDs, err = c.listIDs(ctx, "list recordings of call leg "+ref.CallLegID, recordingsPath, filterCallLegID, ref.CallLegID)
+		errs = append(errs, err)
+	}
+	var transcriptionIDs []string
+	if ref.TranscriptionID != "" {
+		transcriptionIDs = []string{ref.TranscriptionID}
+	} else {
+		for _, id := range recordingIDs {
+			ids, err := c.listIDs(ctx, "list transcriptions of recording "+id, transcriptionsPath, filterRecordingID, id)
+			transcriptionIDs = append(transcriptionIDs, ids...)
+			errs = append(errs, err)
+		}
+	}
+	// Transcriptions were listed by their recording's id, so the recordings
+	// go last.
+	for _, id := range transcriptionIDs {
+		errs = append(errs, c.deleteByID(ctx, "delete transcription "+id, transcriptionsPath, id))
+	}
+	for _, id := range recordingIDs {
+		errs = append(errs, c.deleteByID(ctx, "delete recording "+id, recordingsPath, id))
+	}
+	return errors.Join(errs...)
+}
+
+// listIDs returns any IDs found before an error so cleanup can still proceed.
+func (c *Client) listIDs(ctx context.Context, op, path, filter, id string) ([]string, error) {
+	query := url.Values{filter: {id}}
+	var ids []string
+	var errs []error
+	seenCursors := make(map[string]bool)
+	for page := 1; ; page++ {
+		var reply listReply
+		if err := c.send(ctx, op, http.MethodGet, path+"?"+query.Encode(), nil, &reply); err != nil {
+			return ids, errors.Join(append(errs, err)...)
+		}
+		if reply.Data == nil {
+			errs = append(errs, c.errorf("telnyx %s: missing list data on page %d", op, page))
+		}
+		for _, item := range reply.Data {
+			if item.ID == "" {
+				errs = append(errs, c.errorf("telnyx %s: missing id in list on page %d", op, page))
+				continue
+			}
+			ids = append(ids, item.ID)
+		}
+		// Transcriptions can use cursors. Keep the original path and filter
+		// when constructing the next request.
+		switch after := reply.Meta.Cursors.After; {
+		case after != "":
+			if seenCursors[after] {
+				err := c.errorf("telnyx %s: repeated list cursor on page %d", op, page)
+				return ids, errors.Join(append(errs, err)...)
+			}
+			seenCursors[after] = true
+			query.Del(pageNumberParam)
+			query.Set(pageAfterParam, after)
+		case reply.Meta.Next != "":
+			err := c.errorf("telnyx %s: missing next list cursor on page %d", op, page)
+			return ids, errors.Join(append(errs, err)...)
+		case page < reply.Meta.TotalPages:
+			query.Del(pageAfterParam)
+			query.Set(pageNumberParam, strconv.Itoa(page+1))
+		default:
+			return ids, errors.Join(errs...)
+		}
+	}
+}
+
+// deleteByID deletes path/id; a 404 means it is already gone.
+func (c *Client) deleteByID(ctx context.Context, op, path, id string) error {
+	// PathEscape leaves standalone dot segments unchanged.
+	if id == "." || id == ".." {
+		return c.errorf("telnyx %s: invalid resource id", op)
+	}
+	err := c.send(ctx, op, http.MethodDelete, path+"/"+url.PathEscape(id), nil, nil)
+	var apiErr *APIError
+	if errors.As(err, &apiErr) && apiErr.Status == http.StatusNotFound {
+		return nil
+	}
+	return err
 }
 
 // Download copies the recording at link into dst unchanged. The link is
@@ -288,20 +421,27 @@ func (c *Client) action(ctx context.Context, callControlID, action string, body 
 		return c.errorf("telnyx %s: empty call control id", op)
 	}
 	path := fmt.Sprintf(actionPathFmt, url.PathEscape(callControlID), action)
-	return c.post(ctx, op, path, body, nil)
+	return c.send(ctx, op, http.MethodPost, path, body, nil)
 }
 
-// post sends body as JSON to path and, when out is not nil, decodes the reply into it.
-func (c *Client) post(ctx context.Context, op, path string, body, out any) error {
-	payload, err := json.Marshal(body)
-	if err != nil {
-		return c.errorf("telnyx %s: encode body: %w", op, err)
+// send sends a method request to path, with body as JSON when body is not nil,
+// and, when out is not nil, decodes the reply into it.
+func (c *Client) send(ctx context.Context, op, method, path string, body, out any) error {
+	var payload io.Reader
+	if body != nil {
+		encoded, err := json.Marshal(body)
+		if err != nil {
+			return c.errorf("telnyx %s: encode body: %w", op, err)
+		}
+		payload = bytes.NewReader(encoded)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+path, bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, payload)
 	if err != nil {
 		return c.errorf("telnyx %s: build request: %w", op, err)
 	}
-	req.Header.Set("Content-Type", contentTypeJSON)
+	if body != nil {
+		req.Header.Set("Content-Type", contentTypeJSON)
+	}
 	req.Header.Set("Accept", contentTypeJSON)
 	c.authorize(req)
 	resp, err := c.hc.Do(req)

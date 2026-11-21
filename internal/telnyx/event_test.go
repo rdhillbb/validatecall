@@ -341,3 +341,47 @@ func TestParseEventRejects(t *testing.T) {
 		})
 	}
 }
+
+// TC-58: only the transcription-saved payload documents the two ids.
+func TestParseRecordingIDs(t *testing.T) {
+	at, err := time.Parse(time.RFC3339Nano, sampleOccurredAt)
+	if err != nil {
+		t.Fatalf("parse sample time: %v", err)
+	}
+	const (
+		recordingID     = "35a6f1b2-0c1d-4e8f-9a7b-1c2d3e4f5a6b"
+		transcriptionID = "7b1c2d3e-4f5a-4b6c-8d9e-0f1a2b3c4d5e"
+	)
+	ids := fmt.Sprintf(`"recording_id":%q,"recording_transcription_id":%q`, recordingID, transcriptionID)
+	cases := []struct {
+		name      string
+		eventType string
+		payload   string
+		want      Event
+	}{
+		{"transcription saved with both ids", EventTranscriptionSaved,
+			fmt.Sprintf(`{"call_control_id":%q,"status":"completed","transcription_text":"Hi.",%s}`, sampleCallID, ids),
+			Event{Type: EventTranscriptionSaved, CallControlID: sampleCallID, TranscriptionText: "Hi.",
+				RecordingID: recordingID, TranscriptionID: transcriptionID, OccurredAt: at}},
+		{"transcription saved without ids", EventTranscriptionSaved,
+			fmt.Sprintf(`{"call_control_id":%q,"status":"completed","transcription_text":"Hi."}`, sampleCallID),
+			Event{Type: EventTranscriptionSaved, CallControlID: sampleCallID, TranscriptionText: "Hi.", OccurredAt: at}},
+		{"recording saved", EventRecordingSaved,
+			fmt.Sprintf(`{"call_control_id":%q,"recording_urls":{"mp3":%q},%s}`, sampleCallID, sampleMP3URL, ids),
+			Event{Type: EventRecordingSaved, CallControlID: sampleCallID, RecordingURL: sampleMP3URL, OccurredAt: at}},
+		{"unknown type", "call.initiated",
+			fmt.Sprintf(`{"call_control_id":%q,%s}`, sampleCallID, ids),
+			Event{Type: "call.initiated", CallControlID: sampleCallID}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := ParseEvent(eventBody(tc.eventType, tc.payload))
+			if err != nil {
+				t.Fatalf("ParseEvent: %v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("ParseEvent =\n %+v\nwant\n %+v", got, tc.want)
+			}
+		})
+	}
+}

@@ -87,7 +87,11 @@ type Event struct {
 	DetectionResult   string
 	RecordingURL      string
 	TranscriptionText string
-	OccurredAt        time.Time
+	// RecordingID and TranscriptionID come only from a transcription-saved
+	// payload; the recording-saved schema documents no recording id (TC-58).
+	RecordingID     string
+	TranscriptionID string
+	OccurredAt      time.Time
 }
 
 type eventEnvelope struct {
@@ -106,6 +110,8 @@ type eventPayload struct {
 	SIPHangupCause    numberOrText `json:"sip_hangup_cause"`
 	Result            string       `json:"result"`
 	TranscriptionText string       `json:"transcription_text"`
+	RecordingID       string       `json:"recording_id"`
+	TranscriptionID   string       `json:"recording_transcription_id"`
 	RecordingURLs     struct {
 		// The dial asks for mp3 recordings (client.go recordingFormat).
 		MP3 string `json:"mp3"`
@@ -164,6 +170,8 @@ func ParseEvent(body []byte) (Event, error) {
 		ev.RecordingURL = payload.RecordingURLs.MP3
 	case EventTranscriptionSaved:
 		ev.TranscriptionText = payload.TranscriptionText
+		ev.RecordingID = payload.RecordingID
+		ev.TranscriptionID = payload.TranscriptionID
 	default:
 		return ev, nil
 	}
